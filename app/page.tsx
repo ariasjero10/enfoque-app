@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react";
 import { supabase, supabaseConfigured } from "@/lib/supabase";
 import { useSyncedData } from "@/lib/useSyncedData";
-import DashboardApp, { defaultData } from "@/components/DashboardApp";
+import DashboardApp, { defaultData, migrateData } from "@/components/DashboardApp";
 import Login from "@/components/Login";
 
 /**
@@ -26,7 +26,7 @@ export default function Home() {
   }, []);
 
   const userId = session?.user?.id ?? null;
-  const { data, setData, saved, error } = useSyncedData(userId, defaultData);
+  const { data, setData, saved, error } = useSyncedData(userId, defaultData, migrateData);
 
   if (!supabaseConfigured) {
     return (

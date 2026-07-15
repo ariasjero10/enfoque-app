@@ -5,12 +5,18 @@ import {
   Target, CheckCircle2, Circle, Plus, Trash2, Pencil, Play, Square, BookOpen,
   Dumbbell, FolderKanban, BarChart3, ShieldCheck, Settings, Sun, Moon, Search,
   Download, Upload, Menu, X, Clock, Flame, ChevronRight, Timer as TimerIcon,
-  CalendarDays, TrendingUp, Check, Bell, LogOut, Cloud
+  CalendarDays, TrendingUp, Check, Bell, LogOut, Cloud, Languages, Archive,
+  AlarmClock, Undo2, Lock, AlertTriangle, Star
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis,
   Tooltip, CartesianGrid, Legend
 } from "recharts";
+import { pendientesDe } from "@/lib/pendientes";
+import { subscribeToPush, unsubscribeFromPush, pushStatus, pushConfigured } from "@/lib/push";
+import { supabase } from "@/lib/supabase";
+
+export { pendientesDe };
 
 /* ============================================================
    HELPERS — fechas, semanas, utilidades
@@ -34,6 +40,21 @@ const dateFromKey = (k) => {
   const [y, m, d] = k.split("-").map(Number);
   return new Date(y, m - 1, d);
 };
+const keyFromDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+// Día siguiente a una clave: "2026-07-15" -> "2026-07-16"
+const nextDayKey = (k) => {
+  const d = dateFromKey(k);
+  d.setDate(d.getDate() + 1);
+  return keyFromDate(d);
+};
+// Distancia en días entre dos claves (b - a)
+const daysBetweenKeys = (a, b) =>
+  Math.round((dateFromKey(b) - dateFromKey(a)) / 86400000);
+// "jueves 16 de julio"
+const fmtDayLong = (k) =>
+  dateFromKey(k).toLocaleDateString("es-CO", { weekday: "long", day: "numeric", month: "long" });
+const fmtDayShort = (k) =>
+  dateFromKey(k).toLocaleDateString("es-CO", { weekday: "long", day: "numeric" });
 const weekOfDayKey = (dayKey) => weekKeyOf(dateFromKey(dayKey));
 const shiftWeek = (wk, delta) => {
   // devuelve la clave de semana desplazada `delta` semanas desde hoy
@@ -51,9 +72,23 @@ const fmtClock = (s) => `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
 
 const STAGES = ["Planeación", "Diseño", "Desarrollo", "Pruebas", "Finalizado"];
 
+const emptyDay = () => ({
+  goals: [], workouts: [], readingMinutes: 0, deepWorkMinutes: 0,
+  cycles: 0, german: { done: false, minutes: 0 },
+  sleepHours: null, screenMinutes: null,
+});
+
 export const defaultData = {
   weeklyObjectives: {},          // { "2026-W28": "texto" }
-  days: {},                      // { "2026-07-12": { goals, workouts, readingMinutes, deepWorkMinutes, cycles, rules, sleepHours, screenMinutes } }
+
+  // Registro EN CURSO: lo que está sobre la mesa ahora mismo.
+  // Vive aquí hasta que presiones "Registrar día"; ahí se archiva en `days`
+  // y este queda en blanco, listo para el día siguiente.
+  current: { forDate: null, ...emptyDay() },
+
+  days: {},                      // Días ya registrados. Histórico: no se toca más.
+  weeks: {},                     // Semanas cerradas. { "2026-W28": { sleepAvg, screenAvg, rating, notes, ...snapshot } }
+
   projects: [],
   rules: [
     "No usar redes sociales",
@@ -63,14 +98,50 @@ export const defaultData = {
     "Tomar mínimo 2 litros de agua",
   ].map((t) => ({ id: uid(), text: t })),
   reading: { book: "", plannedMinutes: 30 },
+  german: { plannedMinutes: 20 },
   pomodoro: { work: 25, brk: 5, cycles: 4 },
+  alarm: { enabled: true, hour: 19, goals: true, reading: true, german: true, lastFired: null },
   settings: { theme: "light" },
 };
 
-const emptyDay = () => ({
-  goals: [], workouts: [], readingMinutes: 0, deepWorkMinutes: 0,
-  cycles: 0, rules: {}, sleepHours: null, screenMinutes: null,
-});
+/* Migración de datos existentes al nuevo modelo.
+   Se aplica una sola vez al cargar; nunca borra nada. */
+export function migrateData(d) {
+  const out = { ...d };
+
+  if (!out.current) {
+    // Lo que hubieras escrito hoy con la versión anterior pasa a ser el registro en curso.
+    const tk = todayKey();
+    const hoy = out.days?.[tk];
+    out.current = { ...emptyDay(), ...(hoy || {}), forDate: tk };
+    if (hoy) {
+      const days = { ...out.days };
+      delete days[tk];              // deja de estar duplicado en el histórico
+      out.days = days;
+    }
+  }
+  if (!out.current.forDate) out.current.forDate = todayKey();
+  if (!out.current.german) out.current.german = { done: false, minutes: 0 };
+
+  if (!out.weeks) out.weeks = {};
+  if (!out.german) out.german = { plannedMinutes: 20 };
+  if (!out.alarm) out.alarm = { ...defaultData.alarm };
+
+  return out;
+}
+
+/* Cierra el registro en curso: lo archiva y deja la mesa limpia para el día siguiente. */
+export function registerDay(d) {
+  const fecha = d.current.forDate || todayKey();
+  const { forDate, ...registro } = d.current;
+  return {
+    ...d,
+    days: { ...d.days, [fecha]: registro },
+    current: { ...emptyDay(), forDate: nextDayKey(fecha) },
+  };
+}
+
+
 
 /* ============================================================
    NOTIFICACIONES Y SONIDO
@@ -241,16 +312,11 @@ function WeeklyObjective({ dark, data, setData }) {
    ============================================================ */
 
 function DailyGoals({ dark, data, setData, search }) {
-  const dk = todayKey();
-  const day = data.days[dk] || emptyDay();
+  const day = data.current;
   const goals = (day.goals || []).filter(
     (g) => !search || g.text.toLowerCase().includes(search.toLowerCase())
   );
-  const patch = (fn) =>
-    setData((d) => {
-      const cur = d.days[dk] || emptyDay();
-      return { ...d, days: { ...d.days, [dk]: fn(cur) } };
-    });
+  const patch = (fn) => setData((d) => ({ ...d, current: fn(d.current) }));
   const add = () => patch((c) => ({ ...c, goals: [...c.goals, { id: uid(), text: "Nuevo objetivo", done: false }] }));
   const toggle = (id) => patch((c) => ({ ...c, goals: c.goals.map((g) => (g.id === id ? { ...g, done: !g.done } : g)) }));
   const edit = (id, text) => patch((c) => ({ ...c, goals: c.goals.map((g) => (g.id === id ? { ...g, text } : g)) }));
@@ -280,7 +346,7 @@ function DailyGoals({ dark, data, setData, search }) {
         ))}
         {goals.length === 0 && (
           <p className={`text-sm py-3 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>
-            Define hasta 3 objetivos clave para hoy. Menos es más.
+            Define hasta 3 objetivos clave. Menos es más.
           </p>
         )}
       </div>
@@ -314,24 +380,17 @@ function DeepWork({ dark, data, setData }) {
   const setCfg = (k, v) =>
     setData((d) => ({ ...d, pomodoro: { ...d.pomodoro, [k]: Math.max(1, Number(v) || 1) } }));
 
-  const dk = todayKey();
   const addMinutes = useCallback((mins, addCycle) => {
     if (mins <= 0 && !addCycle) return;
-    setData((d) => {
-      const cur = d.days[dk] || emptyDay();
-      return {
-        ...d,
-        days: {
-          ...d.days,
-          [dk]: {
-            ...cur,
-            deepWorkMinutes: (cur.deepWorkMinutes || 0) + mins,
-            cycles: (cur.cycles || 0) + (addCycle ? 1 : 0),
-          },
-        },
-      };
-    });
-  }, [dk, setData]);
+    setData((d) => ({
+      ...d,
+      current: {
+        ...d.current,
+        deepWorkMinutes: (d.current.deepWorkMinutes || 0) + mins,
+        cycles: (d.current.cycles || 0) + (addCycle ? 1 : 0),
+      },
+    }));
+  }, [setData]);
 
   // Reloj basado en timestamp para mantener precisión
   useEffect(() => {
@@ -384,19 +443,21 @@ function DeepWork({ dark, data, setData }) {
   const total = phase === "break" ? cfg.brk * 60 : cfg.work * 60;
   const pct = phase === "idle" || phase === "done" ? 0 : ((total - remaining) / total) * 100;
 
-  // Estadísticas hoy / semana / mes
+  // Estadísticas en curso / semana / mes.
+  // El día en curso todavía no está en `days`, así que se suma aparte.
   const stats = useMemo(() => {
-    const wk = weekKeyOf(new Date());
-    const month = todayKey().slice(0, 7);
-    let today = 0, week = 0, mon = 0;
+    const fd = data.current.forDate || todayKey();
+    const wk = weekOfDayKey(fd);
+    const month = fd.slice(0, 7);
+    let week = 0, mon = 0;
     Object.entries(data.days).forEach(([k, v]) => {
       const m = v.deepWorkMinutes || 0;
-      if (k === dk) today += m;
       if (weekOfDayKey(k) === wk) week += m;
       if (k.slice(0, 7) === month) mon += m;
     });
-    return { today, week, mon };
-  }, [data.days, dk]);
+    const today = data.current.deepWorkMinutes || 0;
+    return { today, week: week + today, mon: mon + today };
+  }, [data.days, data.current]);
 
   // Anillo de progreso SVG
   const R = 64, C = 2 * Math.PI * R;
@@ -453,7 +514,7 @@ function DeepWork({ dark, data, setData }) {
       </div>
 
       <div className={`grid grid-cols-3 gap-3 mt-5 pt-4 border-t ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
-        {[["Hoy", stats.today], ["Semana", stats.week], ["Mes", stats.mon]].map(([label, v]) => (
+        {[["En curso", stats.today], ["Semana", stats.week], ["Mes", stats.mon]].map(([label, v]) => (
           <div key={label} className="text-center">
             <div className={`text-lg font-bold ${dark ? "text-zinc-100" : "text-zinc-900"}`}>{fmtMin(v)}</div>
             <div className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>{label}</div>
@@ -489,13 +550,8 @@ function DeepWorkConfig({ dark, data, setData }) {
    ============================================================ */
 
 function Workouts({ dark, data, setData, search }) {
-  const dk = todayKey();
-  const day = data.days[dk] || emptyDay();
-  const patch = (fn) =>
-    setData((d) => {
-      const cur = d.days[dk] || emptyDay();
-      return { ...d, days: { ...d.days, [dk]: fn(cur) } };
-    });
+  const day = data.current;
+  const patch = (fn) => setData((d) => ({ ...d, current: fn(d.current) }));
   const add = (name = "Nuevo entrenamiento") =>
     patch((c) => ({ ...c, workouts: [...(c.workouts || []), { id: uid(), name, duration: 45, desc: "", done: false }] }));
   const upd = (id, k, v) => patch((c) => ({ ...c, workouts: c.workouts.map((w) => (w.id === id ? { ...w, [k]: v } : w)) }));
@@ -504,7 +560,7 @@ function Workouts({ dark, data, setData, search }) {
 
   return (
     <Card dark={dark}>
-      <SectionTitle dark={dark} icon={Dumbbell} title="Entrenamientos del día" />
+      <SectionTitle dark={dark} icon={Dumbbell} title="Entrenamientos" />
       <div className="space-y-3">
         {list.map((w) => (
           <div key={w.id} className={`group rounded-xl border p-3 ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
@@ -536,7 +592,7 @@ function Workouts({ dark, data, setData, search }) {
           </div>
         ))}
         {list.length === 0 && (
-          <p className={`text-sm py-2 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>Sin entrenamientos programados para hoy.</p>
+          <p className={`text-sm py-2 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>Sin entrenamientos programados.</p>
         )}
       </div>
       <div className="flex gap-2 mt-3 flex-wrap">
@@ -553,8 +609,7 @@ function Workouts({ dark, data, setData, search }) {
    ============================================================ */
 
 function Reading({ dark, data, setData }) {
-  const dk = todayKey();
-  const day = data.days[dk] || emptyDay();
+  const day = data.current;
   const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState(0); // segundos de la sesión actual
   const startRef = useRef(null);
@@ -570,13 +625,15 @@ function Reading({ dark, data, setData }) {
     setRunning(false);
     const mins = Math.round(elapsed / 60);
     if (mins > 0) {
-      setData((d) => {
-        const cur = d.days[dk] || emptyDay();
-        return { ...d, days: { ...d.days, [dk]: { ...cur, readingMinutes: (cur.readingMinutes || 0) + mins } } };
-      });
+      setData((d) => ({
+        ...d,
+        current: { ...d.current, readingMinutes: (d.current.readingMinutes || 0) + mins },
+      }));
     }
     setElapsed(0);
   };
+  const setMinutes = (v) =>
+    setData((d) => ({ ...d, current: { ...d.current, readingMinutes: Math.max(0, Number(v) || 0) } }));
   const setBook = (t) => setData((d) => ({ ...d, reading: { ...d.reading, book: t } }));
   const setPlanned = (v) => setData((d) => ({ ...d, reading: { ...d.reading, plannedMinutes: Math.max(1, Number(v) || 1) } }));
   const done = day.readingMinutes || 0;
@@ -596,8 +653,15 @@ function Reading({ dark, data, setData }) {
           }`} /> min
       </div>
       <Progress dark={dark} value={pct} color="bg-amber-500" />
-      <div className={`flex justify-between text-xs mt-1.5 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
-        <span>Leído hoy: <b className={dark ? "text-zinc-200" : "text-zinc-700"}>{fmtMin(done)}</b></span>
+      <div className={`flex justify-between items-center text-xs mt-1.5 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+        <span className="flex items-center gap-1.5">
+          Leído:
+          <input type="number" min="0" value={done} onChange={(e) => setMinutes(e.target.value)}
+            className={`w-14 rounded-md border px-1.5 py-0.5 text-xs font-semibold outline-none focus:border-indigo-500 ${
+              dark ? "bg-zinc-950 border-zinc-800 text-zinc-200" : "bg-white border-zinc-200 text-zinc-700"
+            }`} />
+          min
+        </span>
         <span>{Math.min(100, Math.round(pct))}%</span>
       </div>
       <div className="flex items-center gap-3 mt-4">
@@ -609,6 +673,67 @@ function Reading({ dark, data, setData }) {
         ) : (
           <PrimaryBtn onClick={start} className="bg-amber-500 hover:bg-amber-400"><Play size={15} /> Iniciar lectura</PrimaryBtn>
         )}
+      </div>
+    </Card>
+  );
+}
+
+/* ============================================================
+   5b · ALEMÁN
+   ============================================================ */
+
+function German({ dark, data, setData }) {
+  const g = data.current.german || { done: false, minutes: 0 };
+  const meta = data.german?.plannedMinutes || 20;
+  const set = (patch) =>
+    setData((d) => ({ ...d, current: { ...d.current, german: { ...(d.current.german || {}), ...patch } } }));
+  const setMeta = (v) =>
+    setData((d) => ({ ...d, german: { ...d.german, plannedMinutes: Math.max(1, Number(v) || 1) } }));
+
+  return (
+    <Card dark={dark} className={g.done ? "border-l-4 border-l-emerald-500" : ""}>
+      <SectionTitle dark={dark} icon={Languages} title="Alemán" />
+      <p className={`text-sm mb-3 ${dark ? "text-zinc-300" : "text-zinc-700"}`}>¿Estudiaste alemán?</p>
+
+      <div className="flex gap-2">
+        <button
+          onClick={() => set({ done: true, minutes: g.minutes || meta })}
+          className={`flex-1 rounded-xl border px-4 py-2.5 text-sm font-medium transition-all active:scale-95 ${
+            g.done
+              ? "bg-emerald-500 border-emerald-500 text-white"
+              : dark ? "border-zinc-700 text-zinc-300 hover:bg-zinc-800" : "border-zinc-200 text-zinc-600 hover:bg-zinc-50"
+          }`}
+        >
+          <span className="inline-flex items-center gap-1.5"><Check size={15} /> Sí</span>
+        </button>
+        <button
+          onClick={() => set({ done: false, minutes: 0 })}
+          className={`flex-1 rounded-xl border px-4 py-2.5 text-sm font-medium transition-all active:scale-95 ${
+            !g.done
+              ? dark ? "bg-zinc-800 border-zinc-700 text-zinc-200" : "bg-zinc-100 border-zinc-200 text-zinc-700"
+              : dark ? "border-zinc-700 text-zinc-400 hover:bg-zinc-800" : "border-zinc-200 text-zinc-500 hover:bg-zinc-50"
+          }`}
+        >
+          <span className="inline-flex items-center gap-1.5"><X size={15} /> Todavía no</span>
+        </button>
+      </div>
+
+      {g.done && (
+        <div className={`flex items-center gap-2 text-xs mt-3 ${dark ? "text-zinc-400" : "text-zinc-500"}`}>
+          Minutos
+          <input type="number" min="0" value={g.minutes ?? 0} onChange={(e) => set({ minutes: Math.max(0, Number(e.target.value) || 0) })}
+            className={`w-16 rounded-md border px-1.5 py-0.5 text-xs font-semibold outline-none focus:border-indigo-500 ${
+              dark ? "bg-zinc-950 border-zinc-800 text-zinc-200" : "bg-white border-zinc-200 text-zinc-700"
+            }`} />
+        </div>
+      )}
+
+      <div className={`flex items-center gap-2 text-xs mt-3 pt-3 border-t ${dark ? "text-zinc-500 border-zinc-800" : "text-zinc-400 border-zinc-100"}`}>
+        Meta diaria
+        <input type="number" min="1" value={meta} onChange={(e) => setMeta(e.target.value)}
+          className={`w-14 rounded-md border px-1.5 py-0.5 text-xs outline-none focus:border-indigo-500 ${
+            dark ? "bg-zinc-950 border-zinc-800 text-zinc-300" : "bg-white border-zinc-200 text-zinc-600"
+          }`} /> min
       </div>
     </Card>
   );
@@ -738,11 +863,21 @@ function Rules({ dark, data, setData, search }) {
    7 · DASHBOARD SEMANAL — métricas, comparación e históricos
    ============================================================ */
 
-// Calcula las métricas agregadas de una semana a partir del historial diario
-function weekMetrics(days, wk) {
-  const entries = Object.entries(days).filter(([k]) => weekOfDayKey(k) === wk);
-  let sleep = [], screen = [], run = 0, gym = 0, deep = 0, read = 0, goalsDone = 0, goalsTotal = 0;
-  entries.forEach(([, v]) => {
+/* Métricas que la app calcula sola, a partir de los días registrados de esa semana.
+   Si `includeCurrent` viene, el día que aún está sobre la mesa también cuenta. */
+function weekMetrics(data, wk, includeCurrent = true) {
+  const registros = Object.entries(data.days)
+    .filter(([k]) => weekOfDayKey(k) === wk)
+    .map(([, v]) => v);
+
+  // El día en curso todavía no está archivado, pero ya cuenta para la semana en curso.
+  const fd = data.current?.forDate;
+  if (includeCurrent && fd && weekOfDayKey(fd) === wk) registros.push(data.current);
+
+  let sleep = [], screen = [], run = 0, gym = 0, deep = 0, read = 0;
+  let goalsDone = 0, goalsTotal = 0, germanDays = 0, germanMin = 0;
+
+  registros.forEach((v) => {
     if (v.sleepHours != null) sleep.push(v.sleepHours);
     if (v.screenMinutes != null) screen.push(v.screenMinutes);
     (v.workouts || []).forEach((w) => {
@@ -755,18 +890,29 @@ function weekMetrics(days, wk) {
     read += v.readingMinutes || 0;
     goalsDone += (v.goals || []).filter((g) => g.done).length;
     goalsTotal += (v.goals || []).length;
+    if (v.german?.done) { germanDays++; germanMin += v.german.minutes || 0; }
   });
-  const daysCount = entries.length || 1;
-  // Cumplimiento semanal basado en los objetivos diarios completados
+
   const compliance = goalsTotal > 0 ? Math.round((goalsDone / goalsTotal) * 100) : 0;
   return {
+    // Estos dos solo aparecen si vienen de datos antiguos; ahora se ingresan al cerrar la semana.
     sleepAvg: sleep.length ? +(sleep.reduce((a, b) => a + b, 0) / sleep.length).toFixed(1) : null,
     screenAvg: screen.length ? Math.round(screen.reduce((a, b) => a + b, 0) / screen.length) : null,
     run, gym,
     deepHours: +(deep / 60).toFixed(1),
     readMin: read,
-    goalsDone, compliance, daysCount,
+    goalsDone, goalsTotal, compliance,
+    germanDays, germanMin,
+    daysCount: registros.length,
   };
+}
+
+/* Una semana ya cerrada devuelve sus números congelados.
+   Una semana abierta se calcula en vivo. */
+function weekSummary(data, wk) {
+  const cerrada = data.weeks?.[wk];
+  if (cerrada) return { ...cerrada, closed: true };
+  return { ...weekMetrics(data, wk), closed: false };
 }
 
 function MetricCard({ dark, label, value, sub, color = "text-indigo-500" }) {
@@ -779,32 +925,138 @@ function MetricCard({ dark, label, value, sub, color = "text-indigo-500" }) {
   );
 }
 
+/* Formulario de cierre: lo único que la app no puede saber por sí sola. */
+function WeekClose({ dark, data, setData, wk, live }) {
+  const cerrada = data.weeks?.[wk];
+  const [draft, setDraft] = useState({ sleepAvg: "", screenAvg: "", rating: 0, notes: "" });
+  const esDomingo = new Date().getDay() === 0;
+
+  const cerrar = () => {
+    const snapshot = weekMetrics(data, wk);   // congela lo calculado en este momento
+    setData((d) => ({
+      ...d,
+      weeks: {
+        ...d.weeks,
+        [wk]: {
+          ...snapshot,
+          sleepAvg: draft.sleepAvg === "" ? snapshot.sleepAvg : Number(draft.sleepAvg),
+          screenAvg: draft.screenAvg === "" ? snapshot.screenAvg : Number(draft.screenAvg),
+          rating: draft.rating || null,
+          notes: draft.notes.trim(),
+          closedAt: new Date().toISOString(),
+        },
+      },
+    }));
+  };
+
+  const reabrir = () =>
+    setData((d) => {
+      const weeks = { ...d.weeks };
+      delete weeks[wk];
+      return { ...d, weeks };
+    });
+
+  if (cerrada) {
+    return (
+      <div className={`rounded-xl border p-4 mb-5 ${dark ? "border-emerald-900 bg-emerald-950 bg-opacity-30" : "border-emerald-200 bg-emerald-50"}`}>
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2">
+            <Lock size={14} className="text-emerald-600" />
+            <span className="text-sm font-semibold text-emerald-600">Semana cerrada</span>
+            {cerrada.rating && (
+              <span className="flex items-center gap-0.5 ml-1">
+                {[1, 2, 3, 4, 5].map((n) => (
+                  <Star key={n} size={12} className={n <= cerrada.rating ? "text-amber-500 fill-amber-500" : dark ? "text-zinc-700" : "text-zinc-300"} />
+                ))}
+              </span>
+            )}
+          </div>
+          <GhostBtn dark={dark} onClick={reabrir} className="!py-1 !px-3 text-xs">Reabrir</GhostBtn>
+        </div>
+        {cerrada.notes && (
+          <p className={`text-sm mt-2 ${dark ? "text-zinc-300" : "text-zinc-600"}`}>{cerrada.notes}</p>
+        )}
+        <p className={`text-xs mt-2 ${dark ? "text-zinc-500" : "text-zinc-500"}`}>
+          Estos números ya no cambian aunque edites días anteriores.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`rounded-xl border p-4 mb-5 ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
+      <div className="flex items-center gap-2 mb-1">
+        <Lock size={14} className="text-indigo-500" />
+        <span className={`text-sm font-semibold ${dark ? "text-zinc-200" : "text-zinc-800"}`}>Cerrar la semana</span>
+      </div>
+      <p className={`text-xs mb-4 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+        {esDomingo
+          ? "Es domingo. Completa lo que la app no puede medir y congela la semana."
+          : "Normalmente esto se hace el domingo, pero puedes cerrarla cuando quieras."}
+      </p>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <label className="block">
+          <span className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Sueño promedio (h)</span>
+          <TextInput dark={dark} type="number" step="0.5" min="0" className="mt-1"
+            placeholder={live.sleepAvg != null ? String(live.sleepAvg) : "7.5"}
+            value={draft.sleepAvg} onChange={(e) => setDraft({ ...draft, sleepAvg: e.target.value })} />
+        </label>
+        <label className="block">
+          <span className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Pantalla al día (min)</span>
+          <TextInput dark={dark} type="number" min="0" className="mt-1"
+            placeholder={live.screenAvg != null ? String(live.screenAvg) : "180"}
+            value={draft.screenAvg} onChange={(e) => setDraft({ ...draft, screenAvg: e.target.value })} />
+        </label>
+        <div>
+          <span className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>¿Cómo estuvo la semana?</span>
+          <div className="flex gap-1 mt-2">
+            {[1, 2, 3, 4, 5].map((n) => (
+              <button key={n} onClick={() => setDraft({ ...draft, rating: n })} title={`${n} de 5`}>
+                <Star size={20} className={n <= draft.rating ? "text-amber-500 fill-amber-500" : dark ? "text-zinc-700 hover:text-zinc-500" : "text-zinc-300 hover:text-zinc-400"} />
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <label className="block mt-4">
+        <span className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Qué aprendiste o qué cambiarías</span>
+        <TextInput dark={dark} className="mt-1" placeholder="Opcional, pero es lo que más sirve al releerlo…"
+          value={draft.notes} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} />
+      </label>
+
+      <PrimaryBtn onClick={cerrar} className="mt-4"><Lock size={14} /> Cerrar semana {wk}</PrimaryBtn>
+    </div>
+  );
+}
+
 function WeeklyDashboard({ dark, data, setData }) {
-  const dk = todayKey();
-  const day = data.days[dk] || emptyDay();
-  
-  const wkNow = shiftWeek(null, 0);
+  const wkNow = weekKeyOf(new Date());
   const wkPrev = shiftWeek(null, -1);
   const wkMonth = shiftWeek(null, -4);
-  const mNow = useMemo(() => weekMetrics(data.days, wkNow), [data.days, wkNow]);
-  const mPrev = useMemo(() => weekMetrics(data.days, wkPrev), [data.days, wkPrev]);
-  const mMonth = useMemo(() => weekMetrics(data.days, wkMonth), [data.days, wkMonth]);
 
-  // Registro diario de sueño y pantalla (métricas manuales)
-  const patchDay = (k, v) =>
-    setData((d) => {
-      const cur = d.days[dk] || emptyDay();
-      return { ...d, days: { ...d.days, [dk]: { ...cur, [k]: v === "" ? null : Number(v) } } };
-    });
+  const mNow = useMemo(() => weekSummary(data, wkNow), [data, wkNow]);
+  const mPrev = useMemo(() => weekSummary(data, wkPrev), [data, wkPrev]);
+  const mMonth = useMemo(() => weekSummary(data, wkMonth), [data, wkMonth]);
+  const liveNow = useMemo(() => weekMetrics(data, wkNow), [data, wkNow]);
 
-  // Histórico: todas las semanas registradas, nunca se sobrescriben
+  // Histórico: las semanas cerradas mandan; las abiertas se calculan.
   const historical = useMemo(() => {
-    const weeks = [...new Set(Object.keys(data.days).map(weekOfDayKey))].sort();
-    return weeks.map((wk) => {
-      const m = weekMetrics(data.days, wk);
-      return { semana: wk.slice(5), "Trabajo profundo (h)": m.deepHours, "Lectura (min)": m.readMin, "Cumplimiento (%)": m.compliance };
+    const deDias = Object.keys(data.days).map(weekOfDayKey);
+    const deCerradas = Object.keys(data.weeks || {});
+    const todas = [...new Set([...deDias, ...deCerradas])].sort();
+    return todas.map((wk) => {
+      const m = weekSummary(data, wk);
+      return {
+        semana: wk.slice(5),
+        "Trabajo profundo (h)": m.deepHours,
+        "Lectura (min)": m.readMin,
+        "Cumplimiento (%)": m.compliance,
+        "Alemán (días)": m.germanDays ?? 0,
+      };
     });
-  }, [data.days]);
+  }, [data]);
 
   const comparison = [
     { name: "Hace un mes", "Trabajo profundo (h)": mMonth.deepHours, "Lectura (min)": mMonth.readMin, "Cumplimiento (%)": mMonth.compliance },
@@ -822,33 +1074,23 @@ function WeeklyDashboard({ dark, data, setData }) {
 
   return (
     <Card dark={dark} className="col-span-1 lg:col-span-2">
-      <SectionTitle dark={dark} icon={BarChart3} title={`Dashboard Semanal · ${wkNow}`} />
+      <SectionTitle dark={dark} icon={BarChart3} title={`Dashboard Semanal · ${wkNow}`}
+        right={<span className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+          {mNow.daysCount ?? 0} {(mNow.daysCount ?? 0) === 1 ? "día registrado" : "días registrados"}
+        </span>} />
 
-      {/* Registro rápido del día */}
-      <div className={`flex flex-wrap items-center gap-4 rounded-xl border p-3 mb-4 ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
-        <span className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Registro de hoy:</span>
-        <label className={`flex items-center gap-2 text-xs ${dark ? "text-zinc-400" : "text-zinc-500"}`}>
-          Sueño (h)
-          <input type="number" step="0.5" min="0" value={day.sleepHours ?? ""} onChange={(e) => patchDay("sleepHours", e.target.value)}
-            className={`w-16 rounded-md border px-1.5 py-1 text-xs outline-none focus:border-indigo-500 ${dark ? "bg-zinc-950 border-zinc-800 text-zinc-200" : "bg-white border-zinc-200 text-zinc-700"}`} />
-        </label>
-        <label className={`flex items-center gap-2 text-xs ${dark ? "text-zinc-400" : "text-zinc-500"}`}>
-          Pantalla (min)
-          <input type="number" min="0" value={day.screenMinutes ?? ""} onChange={(e) => patchDay("screenMinutes", e.target.value)}
-            className={`w-16 rounded-md border px-1.5 py-1 text-xs outline-none focus:border-indigo-500 ${dark ? "bg-zinc-950 border-zinc-800 text-zinc-200" : "bg-white border-zinc-200 text-zinc-700"}`} />
-        </label>
-      </div>
+      <WeekClose dark={dark} data={data} setData={setData} wk={wkNow} live={liveNow} />
 
       {/* Tarjetas de métricas */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <MetricCard dark={dark} label="Promedio de sueño" value={mNow.sleepAvg != null ? `${mNow.sleepAvg} h` : "—"} color="text-sky-500" />
-        <MetricCard dark={dark} label="Tiempo de pantalla" value={mNow.screenAvg != null ? fmtMin(mNow.screenAvg) : "—"} sub="promedio diario" color="text-rose-500" />
+        <MetricCard dark={dark} label="Promedio de sueño" value={mNow.sleepAvg != null ? `${mNow.sleepAvg} h` : "—"} sub={mNow.closed ? null : "al cerrar la semana"} color="text-sky-500" />
+        <MetricCard dark={dark} label="Tiempo de pantalla" value={mNow.screenAvg != null ? fmtMin(mNow.screenAvg) : "—"} sub={mNow.closed ? "promedio diario" : "al cerrar la semana"} color="text-rose-500" />
         <MetricCard dark={dark} label="Running" value={mNow.run} sub="sesiones" color="text-emerald-500" />
         <MetricCard dark={dark} label="Gimnasio" value={mNow.gym} sub="sesiones" color="text-emerald-500" />
         <MetricCard dark={dark} label="Trabajo profundo" value={`${mNow.deepHours} h`} color="text-indigo-500" />
         <MetricCard dark={dark} label="Lectura" value={fmtMin(mNow.readMin)} color="text-amber-500" />
-        <MetricCard dark={dark} label="Objetivos cumplidos" value={mNow.goalsDone} color="text-indigo-500" />
-        <MetricCard dark={dark} label="Cumplimiento" value={`${mNow.compliance}%`} color={mNow.compliance >= 70 ? "text-emerald-500" : "text-amber-500"} />
+        <MetricCard dark={dark} label="Alemán" value={`${mNow.germanDays ?? 0}/7`} sub="días" color="text-violet-500" />
+        <MetricCard dark={dark} label="Cumplimiento" value={`${mNow.compliance}%`} sub={`${mNow.goalsDone ?? 0} de ${mNow.goalsTotal ?? 0} objetivos`} color={mNow.compliance >= 70 ? "text-emerald-500" : "text-amber-500"} />
       </div>
 
       {/* Comparación entre semanas */}
@@ -871,9 +1113,12 @@ function WeeklyDashboard({ dark, data, setData }) {
       </div>
 
       {/* Histórico */}
-      <h3 className={`text-xs font-semibold uppercase tracking-widest mt-6 mb-3 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+      <h3 className={`text-xs font-semibold uppercase tracking-widest mt-6 mb-1 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
         Histórico semanal
       </h3>
+      <p className={`text-xs mb-3 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>
+        Semana a semana. Las cerradas quedan congeladas; la actual se mueve hasta que la cierres.
+      </p>
       <div style={{ width: "100%", height: 200 }}>
         <ResponsiveContainer>
           <LineChart data={historical}>
@@ -885,9 +1130,15 @@ function WeeklyDashboard({ dark, data, setData }) {
             <Line type="monotone" dataKey="Trabajo profundo (h)" stroke="#6366f1" strokeWidth={2} dot={{ r: 3 }} />
             <Line type="monotone" dataKey="Lectura (min)" stroke="#f59e0b" strokeWidth={2} dot={{ r: 3 }} />
             <Line type="monotone" dataKey="Cumplimiento (%)" stroke="#10b981" strokeWidth={2} dot={{ r: 3 }} />
+            <Line type="monotone" dataKey="Alemán (días)" stroke="#8b5cf6" strokeWidth={2} dot={{ r: 3 }} />
           </LineChart>
         </ResponsiveContainer>
       </div>
+      {historical.length === 0 && (
+        <p className={`text-sm text-center py-6 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>
+          Registra tu primer día y aquí empezará a construirse tu historia.
+        </p>
+      )}
     </Card>
   );
 }
@@ -940,6 +1191,296 @@ function GeneralPanel({ dark, data, setData, saved }) {
 }
 
 /* ============================================================
+   REGISTRAR DÍA — archiva lo que está sobre la mesa y la deja limpia
+   ============================================================ */
+
+function RegisterDay({ dark, data, setData }) {
+  const [confirming, setConfirming] = useState(false);
+  const [undo, setUndo] = useState(null);   // snapshot para deshacer, solo en memoria
+
+  // La ventana de arrepentimiento dura 30 s; después la tarjeta vuelve a la normalidad.
+  useEffect(() => {
+    if (!undo) return;
+    const t = setTimeout(() => setUndo(null), 30000);
+    return () => clearTimeout(t);
+  }, [undo]);
+
+  const fd = data.current.forDate || todayKey();
+  const c = data.current;
+
+  const resumen = [
+    { label: "Objetivos", val: `${(c.goals || []).filter((g) => g.done).length}/${(c.goals || []).length}` },
+    { label: "Trabajo profundo", val: fmtMin(c.deepWorkMinutes || 0) },
+    { label: "Lectura", val: fmtMin(c.readingMinutes || 0) },
+    { label: "Entrenamientos", val: `${(c.workouts || []).filter((w) => w.done).length}/${(c.workouts || []).length}` },
+    { label: "Alemán", val: c.german?.done ? `Sí · ${c.german.minutes || 0}m` : "No" },
+  ];
+
+  const vacio =
+    (c.goals || []).length === 0 && (c.workouts || []).length === 0 &&
+    !(c.readingMinutes || 0) && !(c.deepWorkMinutes || 0) && !c.german?.done;
+
+  const confirmar = () => {
+    setUndo(data);                       // por si te arrepientes
+    setData((d) => registerDay(d));
+    setConfirming(false);
+  };
+  const deshacer = () => { setData(undo); setUndo(null); };
+
+  // ¿Se te quedó un registro viejo sin cerrar?
+  const atraso = daysBetweenKeys(fd, todayKey());
+
+  if (undo) {
+    return (
+      <Card dark={dark} className="border-l-4 border-l-emerald-500">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 size={18} className="text-emerald-500" />
+            <div>
+              <div className={`text-sm font-semibold ${dark ? "text-zinc-100" : "text-zinc-900"}`}>
+                Día registrado · {fmtDayLong(undo.current.forDate || todayKey())}
+              </div>
+              <div className={`text-xs mt-0.5 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+                La mesa quedó limpia. Ahora estás planeando {fmtDayShort(data.current.forDate)}.
+              </div>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <GhostBtn dark={dark} onClick={deshacer}><Undo2 size={14} /> Deshacer</GhostBtn>
+            <GhostBtn dark={dark} onClick={() => setUndo(null)}>Listo</GhostBtn>
+          </div>
+        </div>
+      </Card>
+    );
+  }
+
+  return (
+    <Card dark={dark}>
+      <SectionTitle dark={dark} icon={Archive} title="Cerrar el día"
+        right={<span className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>{fmtDayLong(fd)}</span>} />
+
+      {atraso >= 1 && (
+        <div className={`flex items-start gap-2 rounded-xl border p-3 mb-4 ${dark ? "border-amber-900 bg-amber-950 bg-opacity-30" : "border-amber-200 bg-amber-50"}`}>
+          <AlertTriangle size={15} className="text-amber-500 shrink-0 mt-0.5" />
+          <p className={`text-xs ${dark ? "text-amber-200" : "text-amber-800"}`}>
+            Este registro es del <b>{fmtDayLong(fd)}</b> y hoy ya es {fmtDayShort(todayKey())}.
+            Regístralo para archivarlo en su fecha correcta y empezar uno nuevo.
+          </p>
+        </div>
+      )}
+
+      <div className={`grid grid-cols-2 sm:grid-cols-5 gap-2 mb-4`}>
+        {resumen.map((r) => (
+          <div key={r.label} className={`rounded-xl border px-3 py-2 ${dark ? "border-zinc-800 bg-zinc-950" : "border-zinc-100 bg-zinc-50"}`}>
+            <div className={`text-sm font-bold ${dark ? "text-zinc-100" : "text-zinc-900"}`}>{r.val}</div>
+            <div className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>{r.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {confirming ? (
+        <div className={`rounded-xl border p-4 ${dark ? "border-indigo-800 bg-indigo-950 bg-opacity-30" : "border-indigo-200 bg-indigo-50"}`}>
+          <p className={`text-sm font-medium ${dark ? "text-zinc-100" : "text-zinc-900"}`}>
+            Se guardará todo esto como tu {fmtDayLong(fd)}.
+          </p>
+          <p className={`text-xs mt-1 ${dark ? "text-zinc-400" : "text-zinc-600"}`}>
+            La página queda en blanco para que escribas el plan de {fmtDayShort(nextDayKey(fd))}.
+            Tu objetivo de la semana, proyectos y reglas se quedan donde están.
+          </p>
+          <div className="flex gap-2 mt-4">
+            <PrimaryBtn onClick={confirmar}><Check size={15} /> Registrar</PrimaryBtn>
+            <GhostBtn dark={dark} onClick={() => setConfirming(false)}>Cancelar</GhostBtn>
+          </div>
+        </div>
+      ) : (
+        <>
+          <button
+            onClick={() => setConfirming(true)}
+            disabled={vacio}
+            className={`w-full inline-flex items-center justify-center gap-2 rounded-xl text-white text-sm font-semibold px-4 py-3 transition-all ${
+              vacio ? "bg-zinc-400 cursor-not-allowed opacity-50" : "bg-indigo-600 hover:bg-indigo-500 active:scale-[.99]"
+            }`}
+          >
+            <Archive size={16} /> Registrar día · {fmtDayShort(fd)}
+          </button>
+          <p className={`text-xs mt-2 text-center ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+            {vacio
+              ? "Todavía no hay nada que registrar."
+              : "Archiva el día y deja la página lista para el siguiente."}
+          </p>
+        </>
+      )}
+    </Card>
+  );
+}
+
+/* ============================================================
+   ALARMA — te avisa si a tu hora quedan pendientes
+   ============================================================ */
+
+function useAlarm(data, setData) {
+  const ref = useRef({ data, setData });
+  ref.current = { data, setData };
+
+  useEffect(() => {
+    const check = () => {
+      const { data: d, setData: sd } = ref.current;
+      const a = d?.alarm;
+      if (!a?.enabled) return;
+      const ahora = new Date();
+      if (ahora.getHours() !== Number(a.hour)) return;
+      if (a.lastFired === todayKey()) return;         // una vez al día, no cada minuto
+      const pend = pendientesDe(d);
+      if (pend.length === 0) return;
+      notify("Enfoque · te falta algo hoy", pend.join(" · "));
+      playChime();
+      sd((x) => ({ ...x, alarm: { ...x.alarm, lastFired: todayKey() } }));
+    };
+    const iv = setInterval(check, 60000);
+    check();
+    return () => clearInterval(iv);
+  }, []);
+}
+
+function AlarmSettings({ dark, data, setData }) {
+  const a = data.alarm || {};
+  const set = (patch) => setData((d) => ({ ...d, alarm: { ...d.alarm, ...patch } }));
+  const pend = pendientesDe(data);
+
+  return (
+    <Card dark={dark}>
+      <SectionTitle dark={dark} icon={AlarmClock} title="Recordatorio diario"
+        right={
+          <button
+            onClick={() => { if (!a.enabled) askNotifPermission(); set({ enabled: !a.enabled }); }}
+            className={`relative w-10 h-5 rounded-full transition-colors ${a.enabled ? "bg-indigo-600" : dark ? "bg-zinc-700" : "bg-zinc-300"}`}
+          >
+            <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${a.enabled ? "left-[22px]" : "left-0.5"}`} />
+          </button>
+        } />
+
+      <p className={`text-sm ${dark ? "text-zinc-400" : "text-zinc-500"}`}>
+        Si a la hora que elijas todavía te falta algo del día, la app te avisa.
+      </p>
+
+      <div className={`flex items-center gap-2 mt-4 text-sm ${dark ? "text-zinc-300" : "text-zinc-700"}`}>
+        Avísame a las
+        <select
+          value={a.hour ?? 19} onChange={(e) => set({ hour: Number(e.target.value) })}
+          className={`rounded-lg border px-2 py-1.5 text-sm font-semibold outline-none focus:border-indigo-500 ${
+            dark ? "bg-zinc-950 border-zinc-800 text-zinc-100" : "bg-white border-zinc-200 text-zinc-800"
+          }`}
+        >
+          {[18, 19, 20, 21, 22].map((h) => (
+            <option key={h} value={h}>{h > 12 ? `${h - 12}:00 pm` : `${h}:00 am`}</option>
+          ))}
+        </select>
+      </div>
+
+      <div className="mt-4 space-y-2">
+        <p className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Recordarme sobre:</p>
+        {[["goals", "Objetivos del día"], ["reading", "Lectura"], ["german", "Alemán"]].map(([k, label]) => (
+          <label key={k} className={`flex items-center gap-2.5 text-sm cursor-pointer ${dark ? "text-zinc-300" : "text-zinc-700"}`}>
+            <button onClick={() => set({ [k]: !a[k] })} className="shrink-0">
+              {a[k] ? <CheckCircle2 size={18} className="text-indigo-500" /> : <Circle size={18} className={dark ? "text-zinc-600" : "text-zinc-300"} />}
+            </button>
+            {label}
+          </label>
+        ))}
+      </div>
+
+      <div className={`mt-4 pt-4 border-t ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
+        <p className={`text-xs font-medium mb-1.5 ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Ahora mismo te falta:</p>
+        {pend.length === 0 ? (
+          <p className="text-sm text-emerald-500 flex items-center gap-1.5"><Check size={15} /> Nada. Vas al día.</p>
+        ) : (
+          <ul className={`text-sm space-y-0.5 ${dark ? "text-zinc-300" : "text-zinc-700"}`}>
+            {pend.map((p) => <li key={p} className="flex items-center gap-1.5"><span className="w-1 h-1 rounded-full bg-amber-500" /> {p}</li>)}
+          </ul>
+        )}
+      </div>
+
+      <PushControl dark={dark} />
+    </Card>
+  );
+}
+
+/* Recordatorios con la app cerrada. Se activan por dispositivo:
+   el celular y el PC son suscripciones distintas. */
+function PushControl({ dark }) {
+  const [estado, setEstado] = useState("cargando");   // cargando | on | off | denied | unsupported
+  const [error, setError] = useState(null);
+  const [ocupado, setOcupado] = useState(false);
+
+  useEffect(() => { pushStatus().then(setEstado); }, []);
+
+  const activar = async () => {
+    setOcupado(true); setError(null);
+    try {
+      const { data: s } = await supabase.auth.getSession();
+      const uid = s?.session?.user?.id;
+      if (!uid) throw new Error("Vuelve a iniciar sesión.");
+      await subscribeToPush(uid);
+      setEstado("on");
+    } catch (e) { setError(e.message); }
+    setOcupado(false);
+  };
+
+  const desactivar = async () => {
+    setOcupado(true); setError(null);
+    try { await unsubscribeFromPush(); setEstado("off"); }
+    catch (e) { setError(e.message); }
+    setOcupado(false);
+  };
+
+  return (
+    <div className={`mt-4 pt-4 border-t ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
+      <p className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Con la app cerrada</p>
+      <p className={`text-xs mt-1 mb-3 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+        Se activa en cada dispositivo por separado. Hazlo también en el celular.
+      </p>
+
+      {!pushConfigured && (
+        <p className={`text-xs ${dark ? "text-amber-400" : "text-amber-600"}`}>
+          Falta configurar las variables de entorno en Vercel. Mira GUIA-RECORDATORIOS.md.
+        </p>
+      )}
+
+      {pushConfigured && estado === "unsupported" && (
+        <p className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+          Este navegador no admite recordatorios. En iPhone, instala la app en la pantalla de inicio y ábrela desde ahí.
+        </p>
+      )}
+
+      {pushConfigured && estado === "denied" && (
+        <p className={`text-xs ${dark ? "text-amber-400" : "text-amber-600"}`}>
+          Bloqueaste las notificaciones para este sitio. Habilítalas en los ajustes del navegador y recarga.
+        </p>
+      )}
+
+      {pushConfigured && estado === "on" && (
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <span className="text-sm text-emerald-500 flex items-center gap-1.5">
+            <CheckCircle2 size={15} /> Activo en este dispositivo
+          </span>
+          <GhostBtn dark={dark} onClick={desactivar} className="!py-1 !px-3 text-xs">
+            {ocupado ? "…" : "Desactivar"}
+          </GhostBtn>
+        </div>
+      )}
+
+      {pushConfigured && estado === "off" && (
+        <GhostBtn dark={dark} onClick={activar}>
+          <Bell size={14} /> {ocupado ? "Activando…" : "Activar en este dispositivo"}
+        </GhostBtn>
+      )}
+
+      {error && <p className="text-xs mt-2 text-rose-500">{error}</p>}
+    </div>
+  );
+}
+
+/* ============================================================
    NAVEGACIÓN LATERAL
    ============================================================ */
 
@@ -951,9 +1492,11 @@ const TABS = [
   { id: "deep", label: "Trabajo profundo", icon: TimerIcon },
   { id: "entreno", label: "Entrenamientos", icon: Dumbbell },
   { id: "lectura", label: "Lectura", icon: BookOpen },
+  { id: "aleman", label: "Alemán", icon: Languages },
   { id: "proyectos", label: "Proyectos", icon: FolderKanban },
   { id: "metricas", label: "Dashboard semanal", icon: TrendingUp },
   { id: "reglas", label: "Reglas", icon: ShieldCheck },
+  { id: "alarma", label: "Recordatorio", icon: AlarmClock },
 ];
 
 function Sidebar({ dark, tab, setTab, open, setOpen }) {
@@ -1009,9 +1552,15 @@ export default function DashboardApp({ data, setData, saved, userEmail, onSignOu
   const toggleTheme = () =>
     setData((d) => ({ ...d, settings: { ...d.settings, theme: d.settings.theme === "dark" ? "light" : "dark" } }));
 
+  useAlarm(data, setData);
+
   if (data === null) return null;
 
-  const today = new Date().toLocaleDateString("es-CO", { weekday: "long", day: "numeric", month: "long" });
+  // El encabezado muestra el día que estás registrando, que no siempre es hoy:
+  // de noche ya estás trabajando sobre el de mañana.
+  const fd = data.current?.forDate || todayKey();
+  const esHoy = fd === todayKey();
+  const today = fmtDayLong(fd);
 
   return (
     <div className={`min-h-screen flex transition-colors duration-300 ${dark ? "bg-zinc-950 dark" : "bg-zinc-50"}`}>
@@ -1025,8 +1574,13 @@ export default function DashboardApp({ data, setData, saved, userEmail, onSignOu
           <button onClick={() => setMenuOpen(true)} className={`lg:hidden ${dark ? "text-zinc-300" : "text-zinc-600"}`}>
             <Menu size={20} />
           </button>
-          <div className="flex-1 min-w-0">
+          <div className="flex-1 min-w-0 flex items-center gap-2">
             <h1 className={`text-base font-bold capitalize truncate ${dark ? "text-zinc-100" : "text-zinc-900"}`}>{today}</h1>
+            {!esHoy && (
+              <span className="shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full bg-indigo-600 bg-opacity-10 text-indigo-500">
+                Planeando
+              </span>
+            )}
           </div>
           <div className={`hidden sm:flex items-center gap-2 rounded-xl border px-3 py-1.5 ${dark ? "border-zinc-800 bg-zinc-900" : "border-zinc-200 bg-white"}`}>
             <Search size={14} className="text-zinc-400" />
@@ -1058,21 +1612,31 @@ export default function DashboardApp({ data, setData, saved, userEmail, onSignOu
                   <DailyGoals dark={dark} data={data} setData={setData} search={search} />
                   <Workouts dark={dark} data={data} setData={setData} search={search} />
                   <Reading dark={dark} data={data} setData={setData} />
+                  <German dark={dark} data={data} setData={setData} />
                 </div>
                 <div className="space-y-5">
                   <DeepWork dark={dark} data={data} setData={setData} />
                   <Rules dark={dark} data={data} setData={setData} search={search} />
+                  <Projects dark={dark} data={data} setData={setData} search={search} />
                 </div>
               </div>
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
-                <Projects dark={dark} data={data} setData={setData} search={search} />
-                <WeeklyDashboard dark={dark} data={data} setData={setData} />
-              </div>
+
+              {/* El cierre del día vive al final: es lo último que haces. */}
+              <RegisterDay dark={dark} data={data} setData={setData} />
+
+              <WeeklyDashboard dark={dark} data={data} setData={setData} />
             </>
           )}
           {tab === "general" && <GeneralPanel dark={dark} data={data} setData={setData} saved={saved} />}
           {tab === "semanal" && <WeeklyObjective dark={dark} data={data} setData={setData} />}
-          {tab === "dia" && <DailyGoals dark={dark} data={data} setData={setData} search={search} />}
+          {tab === "dia" && (
+            <div className="space-y-5">
+              <DailyGoals dark={dark} data={data} setData={setData} search={search} />
+              <RegisterDay dark={dark} data={data} setData={setData} />
+            </div>
+          )}
+          {tab === "aleman" && <German dark={dark} data={data} setData={setData} />}
+          {tab === "alarma" && <AlarmSettings dark={dark} data={data} setData={setData} />}
           {tab === "deep" && (
             <div className="space-y-5">
               <DeepWork dark={dark} data={data} setData={setData} />
