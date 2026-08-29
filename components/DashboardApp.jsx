@@ -6,7 +6,8 @@ import {
   Dumbbell, FolderKanban, BarChart3, ShieldCheck, Settings, Sun, Moon, Search,
   Download, Upload, Menu, X, Clock, Flame, ChevronRight, Timer as TimerIcon,
   CalendarDays, TrendingUp, Check, Bell, LogOut, Cloud, Languages, Archive,
-  AlarmClock, Undo2, Lock, AlertTriangle, Star
+  AlarmClock, Undo2, Lock, AlertTriangle, Star,
+  Repeat, BookMarked, NotebookPen, Trophy
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis,
@@ -47,6 +48,12 @@ const nextDayKey = (k) => {
   d.setDate(d.getDate() + 1);
   return keyFromDate(d);
 };
+// Día anterior a una clave: "2026-07-15" -> "2026-07-14"
+const prevDayKey = (k) => {
+  const d = dateFromKey(k);
+  d.setDate(d.getDate() - 1);
+  return keyFromDate(d);
+};
 // Distancia en días entre dos claves (b - a)
 const daysBetweenKeys = (a, b) =>
   Math.round((dateFromKey(b) - dateFromKey(a)) / 86400000);
@@ -76,6 +83,8 @@ const emptyDay = () => ({
   goals: [], workouts: [], readingMinutes: 0, deepWorkMinutes: 0,
   cycles: 0, german: { done: false, minutes: 0 },
   sleepHours: null, screenMinutes: null,
+  note: "",          // diario / reflexión del día
+  habits: {},        // { ruleId: true } — no negociables cumplidos ese día
 });
 
 export const defaultData = {
@@ -97,12 +106,30 @@ export const defaultData = {
     "Dormir mínimo 8 horas",
     "Tomar mínimo 2 litros de agua",
   ].map((t) => ({ id: uid(), text: t })),
-  reading: { book: "", plannedMinutes: 30 },
+  reading: { book: "", plannedMinutes: 30, finished: [] },  // finished: estante de libros terminados
+  // Plantillas que se cargan solas cada mañana; puedes borrarlas del día sin borrar la plantilla.
+  recurring: { goals: [], workouts: [] },
   german: { plannedMinutes: 20 },
   pomodoro: { work: 25, brk: 5, cycles: 4 },
   alarm: { enabled: true, hour: 19, goals: true, reading: true, german: true, lastFired: null },
   settings: { theme: "light" },
 };
+
+/* Siembra las rutinas recurrentes en un registro en curso.
+   Se autogestiona: solo siembra una vez por fecha (marca `seededFor`), así que
+   si borras un recurrente del día no vuelve a aparecer. */
+function applyRecurring(current, recurring) {
+  if (!recurring) return current;
+  if (current.seededFor === current.forDate) return current;
+  const g = (recurring.goals || []).map((t) => ({ id: uid(), text: t.text, done: false, fromRecurring: t.id }));
+  const w = (recurring.workouts || []).map((t) => ({ id: uid(), name: t.name, duration: t.duration || 45, desc: t.desc || "", done: false, fromRecurring: t.id }));
+  return {
+    ...current,
+    goals: [...g, ...(current.goals || [])],
+    workouts: [...w, ...(current.workouts || [])],
+    seededFor: current.forDate,
+  };
+}
 
 /* Migración de datos existentes al nuevo modelo.
    Se aplica una sola vez al cargar; nunca borra nada. */
@@ -122,23 +149,77 @@ export function migrateData(d) {
   }
   if (!out.current.forDate) out.current.forDate = todayKey();
   if (!out.current.german) out.current.german = { done: false, minutes: 0 };
+  if (out.current.note == null) out.current.note = "";
+  if (!out.current.habits) out.current.habits = {};
 
   if (!out.weeks) out.weeks = {};
   if (!out.german) out.german = { plannedMinutes: 20 };
   if (!out.alarm) out.alarm = { ...defaultData.alarm };
+  if (!out.recurring) out.recurring = { goals: [], workouts: [] };
+  if (!out.reading) out.reading = { ...defaultData.reading };
+  if (!out.reading.finished) out.reading.finished = [];
+
+  // Carga las rutinas recurrentes del día en curso (idempotente).
+  out.current = applyRecurring(out.current, out.recurring);
 
   return out;
 }
 
-/* Cierra el registro en curso: lo archiva y deja la mesa limpia para el día siguiente. */
+/* Cierra el registro en curso: lo archiva y deja la mesa limpia para el día siguiente.
+   El día nuevo arranca ya con tus rutinas recurrentes cargadas. */
 export function registerDay(d) {
   const fecha = d.current.forDate || todayKey();
-  const { forDate, ...registro } = d.current;
+  const { forDate, seededFor, ...registro } = d.current;
+  const nuevo = applyRecurring({ ...emptyDay(), forDate: nextDayKey(fecha) }, d.recurring);
   return {
     ...d,
     days: { ...d.days, [fecha]: registro },
-    current: { ...emptyDay(), forDate: nextDayKey(fecha) },
+    current: nuevo,
   };
+}
+
+/* ============================================================
+   RACHAS — días seguidos cumpliendo cada hábito
+   ============================================================ */
+
+// ¿Se cumplió el hábito ese día?
+const metGoals   = (r)       => (r.goals || []).length > 0 && (r.goals || []).every((g) => g.done);
+const metReading = (r, data) => (r.readingMinutes || 0) >= (data?.reading?.plannedMinutes || 1);
+const metWorkout = (r)       => (r.workouts || []).some((w) => w.done);
+const metGerman  = (r)       => !!r.german?.done;
+
+// Cuenta días consecutivos (hacia atrás desde hoy) en que se cumplió `metFn`.
+// Si hoy aún no tiene registro, no rompe la racha: empieza desde ayer.
+function trailingStreak(data, metFn) {
+  const rec = (k) => data.days?.[k] || (data.current?.forDate === k ? data.current : null);
+  let k = todayKey();
+  if (!rec(k)) k = prevDayKey(k);
+  let s = 0;
+  for (let i = 0; i < 730; i++) {
+    const r = rec(k);
+    if (r && metFn(r, data)) { s++; k = prevDayKey(k); }
+    else break;
+  }
+  return s;
+}
+
+// Estado de cada día (para el mapa de constancia): últimos N días.
+function constancyRows(data, days = 35) {
+  const habits = [
+    { key: "goals",   label: "Objetivos", met: metGoals },
+    { key: "reading", label: "Lectura",   met: metReading },
+    { key: "workout", label: "Entreno",   met: metWorkout },
+    { key: "german",  label: "Alemán",    met: metGerman },
+  ];
+  const rec = (k) => data.days?.[k] || (data.current?.forDate === k ? data.current : null);
+  const keys = [];
+  let k = todayKey();
+  for (let i = 0; i < days; i++) { keys.unshift(k); k = prevDayKey(k); }
+  return habits.map((h) => ({
+    ...h,
+    cells: keys.map((dk) => { const r = rec(dk); return r ? !!h.met(r, data) : null; }),
+    streak: trailingStreak(data, h.met),
+  }));
 }
 
 
@@ -185,7 +266,7 @@ const playChime = () => {
 const Card = ({ dark, children, className = "" }) => (
   <div
     className={`rounded-2xl border p-5 transition-colors duration-300 ${
-      dark ? "bg-zinc-900 border-zinc-800" : "bg-white border-zinc-200"
+      dark ? "bg-stone-900 border-stone-800" : "bg-white border-stone-200"
     } ${className}`}
     style={{ boxShadow: dark ? "0 1px 3px rgba(0,0,0,.4)" : "0 1px 3px rgba(16,24,40,.06), 0 1px 2px rgba(16,24,40,.04)" }}
   >
@@ -196,8 +277,8 @@ const Card = ({ dark, children, className = "" }) => (
 const SectionTitle = ({ dark, icon: Icon, title, right }) => (
   <div className="flex items-center justify-between mb-4">
     <div className="flex items-center gap-2">
-      <Icon size={17} className="text-indigo-500" />
-      <h2 className={`text-sm font-semibold tracking-wide ${dark ? "text-zinc-100" : "text-zinc-800"}`}>{title}</h2>
+      <Icon size={17} className="text-orange-500" />
+      <h2 className={`text-sm font-semibold tracking-wide ${dark ? "text-stone-100" : "text-stone-800"}`}>{title}</h2>
     </div>
     {right}
   </div>
@@ -207,13 +288,13 @@ const IconBtn = ({ dark, onClick, children, title }) => (
   <button
     onClick={onClick} title={title}
     className={`p-1.5 rounded-lg transition-colors ${
-      dark ? "text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800" : "text-zinc-400 hover:text-zinc-700 hover:bg-zinc-100"
+      dark ? "text-stone-400 hover:text-stone-100 hover:bg-stone-800" : "text-stone-400 hover:text-stone-700 hover:bg-stone-100"
     }`}
   >{children}</button>
 );
 
-const Progress = ({ dark, value, color = "bg-indigo-500", h = "h-2" }) => (
-  <div className={`w-full ${h} rounded-full overflow-hidden ${dark ? "bg-zinc-800" : "bg-zinc-100"}`}>
+const Progress = ({ dark, value, color = "bg-orange-500", h = "h-2" }) => (
+  <div className={`w-full ${h} rounded-full overflow-hidden ${dark ? "bg-stone-800" : "bg-stone-100"}`}>
     <div
       className={`${h} ${color} rounded-full transition-all duration-500`}
       style={{ width: `${Math.min(100, Math.max(0, value))}%` }}
@@ -224,9 +305,9 @@ const Progress = ({ dark, value, color = "bg-indigo-500", h = "h-2" }) => (
 const TextInput = ({ dark, className = "", ...props }) => (
   <input
     {...props}
-    className={`w-full rounded-xl border px-3 py-2 text-sm outline-none transition-colors focus:border-indigo-500 ${
-      dark ? "bg-zinc-950 border-zinc-800 text-zinc-100 placeholder-zinc-600"
-           : "bg-white border-zinc-200 text-zinc-800 placeholder-zinc-400"
+    className={`w-full rounded-xl border px-3 py-2 text-sm outline-none transition-colors focus:border-orange-500 ${
+      dark ? "bg-stone-950 border-stone-800 text-stone-100 placeholder-stone-600"
+           : "bg-white border-stone-200 text-stone-800 placeholder-stone-400"
     } ${className}`}
   />
 );
@@ -234,7 +315,7 @@ const TextInput = ({ dark, className = "", ...props }) => (
 const PrimaryBtn = ({ children, onClick, className = "" }) => (
   <button
     onClick={onClick}
-    className={`inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white text-sm font-medium px-4 py-2 transition-all ${className}`}
+    className={`inline-flex items-center gap-1.5 rounded-xl bg-orange-600 hover:bg-orange-500 active:scale-95 text-white text-sm font-medium px-4 py-2 transition-all ${className}`}
   >{children}</button>
 );
 
@@ -242,7 +323,7 @@ const GhostBtn = ({ dark, children, onClick, className = "" }) => (
   <button
     onClick={onClick}
     className={`inline-flex items-center gap-1.5 rounded-xl border text-sm font-medium px-4 py-2 transition-all active:scale-95 ${
-      dark ? "border-zinc-700 text-zinc-300 hover:bg-zinc-800" : "border-zinc-200 text-zinc-600 hover:bg-zinc-50"
+      dark ? "border-stone-700 text-stone-300 hover:bg-stone-800" : "border-stone-200 text-stone-600 hover:bg-stone-50"
     } ${className}`}
   >{children}</button>
 );
@@ -258,25 +339,25 @@ function InlineEdit({ dark, value, onSave, placeholder, textarea = false, classN
       <textarea
         autoFocus value={draft} onChange={(e) => setDraft(e.target.value)}
         onBlur={commit} rows={2}
-        className={`w-full rounded-xl border px-3 py-2 text-sm outline-none focus:border-indigo-500 resize-none ${
-          dark ? "bg-zinc-950 border-zinc-800 text-zinc-100" : "bg-white border-zinc-200 text-zinc-800"
+        className={`w-full rounded-xl border px-3 py-2 text-sm outline-none focus:border-orange-500 resize-none ${
+          dark ? "bg-stone-950 border-stone-800 text-stone-100" : "bg-white border-stone-200 text-stone-800"
         }`}
       />
     ) : (
       <input
         autoFocus value={draft} onChange={(e) => setDraft(e.target.value)}
         onBlur={commit} onKeyDown={(e) => e.key === "Enter" && commit()}
-        className={`w-full rounded-lg border px-2 py-1 text-sm outline-none focus:border-indigo-500 ${
-          dark ? "bg-zinc-950 border-zinc-800 text-zinc-100" : "bg-white border-zinc-200 text-zinc-800"
+        className={`w-full rounded-lg border px-2 py-1 text-sm outline-none focus:border-orange-500 ${
+          dark ? "bg-stone-950 border-stone-800 text-stone-100" : "bg-white border-stone-200 text-stone-800"
         }`}
       />
     );
   }
   return (
     <div className={`group flex items-start gap-2 ${className}`}>
-      <span className={`${value ? "" : dark ? "text-zinc-600" : "text-zinc-400"}`}>{value || placeholder}</span>
+      <span className={`${value ? "" : dark ? "text-stone-600" : "text-stone-400"}`}>{value || placeholder}</span>
       <button onClick={() => setEditing(true)} className="opacity-0 group-hover:opacity-100 transition-opacity">
-        <Pencil size={13} className="text-zinc-400 hover:text-indigo-500" />
+        <Pencil size={13} className="text-stone-400 hover:text-orange-500" />
       </button>
     </div>
   );
@@ -292,14 +373,14 @@ function WeeklyObjective({ dark, data, setData }) {
   const save = (txt) =>
     setData((d) => ({ ...d, weeklyObjectives: { ...d.weeklyObjectives, [wk]: txt } }));
   return (
-    <Card dark={dark} className="border-l-4 border-l-indigo-500">
+    <Card dark={dark} className="border-l-4 border-l-orange-500">
       <div className="flex items-center gap-2 mb-2">
-        <Target size={16} className="text-indigo-500" />
-        <span className={`text-xs font-semibold uppercase tracking-widest ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+        <Target size={16} className="text-orange-500" />
+        <span className={`text-xs font-semibold uppercase tracking-widest ${dark ? "text-stone-500" : "text-stone-400"}`}>
           Objetivo principal de la semana · {wk}
         </span>
       </div>
-      <div className={`text-lg font-semibold ${dark ? "text-zinc-100" : "text-zinc-900"}`}>
+      <div className={`text-lg font-semibold ${dark ? "text-stone-100" : "text-stone-900"}`}>
         <InlineEdit dark={dark} value={value} onSave={save} textarea
           placeholder="Escribe aquí el objetivo que define tu semana…" />
       </div>
@@ -326,31 +407,31 @@ function DailyGoals({ dark, data, setData, search }) {
   return (
     <Card dark={dark}>
       <SectionTitle dark={dark} icon={Flame} title="Enfoque del día"
-        right={<span className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>{doneCount}/{(day.goals || []).length} completados</span>} />
+        right={<span className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>{doneCount}/{(day.goals || []).length} completados</span>} />
       {(day.goals || []).length > 0 && (
         <div className="mb-4"><Progress dark={dark} value={(doneCount / day.goals.length) * 100} /></div>
       )}
       <div className="space-y-1">
         {goals.map((g) => (
-          <div key={g.id} className={`group flex items-center gap-3 rounded-xl px-2 py-2 transition-colors ${dark ? "hover:bg-zinc-800" : "hover:bg-zinc-50"}`}>
+          <div key={g.id} className={`group flex items-center gap-3 rounded-xl px-2 py-2 transition-colors ${dark ? "hover:bg-stone-800" : "hover:bg-stone-50"}`}>
             <button onClick={() => toggle(g.id)} className="shrink-0">
               {g.done
-                ? <CheckCircle2 size={19} className="text-indigo-500" />
-                : <Circle size={19} className={dark ? "text-zinc-600" : "text-zinc-300"} />}
+                ? <CheckCircle2 size={19} className="text-orange-500" />
+                : <Circle size={19} className={dark ? "text-stone-600" : "text-stone-300"} />}
             </button>
-            <div className={`flex-1 text-sm ${g.done ? "line-through " + (dark ? "text-zinc-600" : "text-zinc-400") : dark ? "text-zinc-200" : "text-zinc-700"}`}>
+            <div className={`flex-1 text-sm ${g.done ? "line-through " + (dark ? "text-stone-600" : "text-stone-400") : dark ? "text-stone-200" : "text-stone-700"}`}>
               <InlineEdit dark={dark} value={g.text} onSave={(t) => t && edit(g.id, t)} placeholder="Objetivo…" />
             </div>
             <IconBtn dark={dark} onClick={() => del(g.id)} title="Eliminar"><Trash2 size={14} /></IconBtn>
           </div>
         ))}
         {goals.length === 0 && (
-          <p className={`text-sm py-3 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>
+          <p className={`text-sm py-3 ${dark ? "text-stone-600" : "text-stone-400"}`}>
             Define hasta 3 objetivos clave. Menos es más.
           </p>
         )}
       </div>
-      <button onClick={add} className={`mt-3 flex items-center gap-1.5 text-sm font-medium text-indigo-500 hover:text-indigo-400 transition-colors`}>
+      <button onClick={add} className={`mt-3 flex items-center gap-1.5 text-sm font-medium text-orange-500 hover:text-orange-400 transition-colors`}>
         <Plus size={15} /> Agregar objetivo
       </button>
     </Card>
@@ -462,12 +543,12 @@ function DeepWork({ dark, data, setData }) {
   // Anillo de progreso SVG
   const R = 64, C = 2 * Math.PI * R;
   const phaseLabel = { idle: "Listo para empezar", work: "Trabajo profundo", break: "Descanso", done: "Sesión completada" }[phase];
-  const ringColor = phase === "break" ? "#10b981" : "#6366f1";
+  const ringColor = phase === "break" ? "#10b981" : "#f97316";
 
   return (
     <Card dark={dark}>
       <SectionTitle dark={dark} icon={TimerIcon} title="Trabajo Profundo"
-        right={<span className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>Ciclo {Math.min(cycle, cfg.cycles)}/{cfg.cycles}</span>} />
+        right={<span className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>Ciclo {Math.min(cycle, cfg.cycles)}/{cfg.cycles}</span>} />
 
       <div className="flex flex-col items-center py-2">
         <div className="relative" style={{ width: 160, height: 160 }}>
@@ -478,14 +559,14 @@ function DeepWork({ dark, data, setData }) {
               style={{ transition: "stroke-dashoffset .4s ease" }} />
           </svg>
           <div className="absolute inset-0 flex flex-col items-center justify-center">
-            <span className={`text-3xl font-bold tabular-nums ${dark ? "text-zinc-100" : "text-zinc-900"}`}>
+            <span className={`text-3xl font-bold tabular-nums ${dark ? "text-stone-100" : "text-stone-900"}`}>
               {phase === "idle" ? fmtClock(cfg.work * 60) : phase === "done" ? "✓" : fmtClock(remaining)}
             </span>
-            <span className={`text-xs mt-1 ${phase === "break" ? "text-emerald-500" : "text-indigo-500"}`}>{phaseLabel}</span>
+            <span className={`text-xs mt-1 ${phase === "break" ? "text-emerald-500" : "text-orange-500"}`}>{phaseLabel}</span>
           </div>
         </div>
 
-        <div className="w-full mt-4"><Progress dark={dark} value={pct} color={phase === "break" ? "bg-emerald-500" : "bg-indigo-500"} /></div>
+        <div className="w-full mt-4"><Progress dark={dark} value={pct} color={phase === "break" ? "bg-emerald-500" : "bg-orange-500"} /></div>
 
         <div className="flex gap-3 mt-5">
           {phase === "idle" || phase === "done" ? (
@@ -498,13 +579,13 @@ function DeepWork({ dark, data, setData }) {
         {/* Configuración rápida, editable directamente en la tarjeta */}
         <div className="flex flex-wrap justify-center gap-4 mt-5">
           {[["work", "Trabajo (min)"], ["brk", "Descanso (min)"], ["cycles", "Ciclos"]].map(([k, label]) => (
-            <label key={k} className={`flex flex-col items-center gap-1 text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+            <label key={k} className={`flex flex-col items-center gap-1 text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>
               <input
                 type="number" min="1" value={cfg[k]}
                 disabled={phase === "work" || phase === "break"}
                 onChange={(e) => setCfg(k, e.target.value)}
-                className={`w-16 text-center rounded-lg border px-2 py-1 text-sm font-semibold outline-none focus:border-indigo-500 transition-colors disabled:opacity-40 ${
-                  dark ? "bg-zinc-950 border-zinc-800 text-zinc-100" : "bg-white border-zinc-200 text-zinc-800"
+                className={`w-16 text-center rounded-lg border px-2 py-1 text-sm font-semibold outline-none focus:border-orange-500 transition-colors disabled:opacity-40 ${
+                  dark ? "bg-stone-950 border-stone-800 text-stone-100" : "bg-white border-stone-200 text-stone-800"
                 }`}
               />
               {label}
@@ -513,11 +594,11 @@ function DeepWork({ dark, data, setData }) {
         </div>
       </div>
 
-      <div className={`grid grid-cols-3 gap-3 mt-5 pt-4 border-t ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
+      <div className={`grid grid-cols-3 gap-3 mt-5 pt-4 border-t ${dark ? "border-stone-800" : "border-stone-100"}`}>
         {[["En curso", stats.today], ["Semana", stats.week], ["Mes", stats.mon]].map(([label, v]) => (
           <div key={label} className="text-center">
-            <div className={`text-lg font-bold ${dark ? "text-zinc-100" : "text-zinc-900"}`}>{fmtMin(v)}</div>
-            <div className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>{label}</div>
+            <div className={`text-lg font-bold ${dark ? "text-stone-100" : "text-stone-900"}`}>{fmtMin(v)}</div>
+            <div className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>{label}</div>
           </div>
         ))}
       </div>
@@ -535,7 +616,7 @@ function DeepWorkConfig({ dark, data, setData }) {
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {[["work", "Trabajo (min)"], ["brk", "Descanso (min)"], ["cycles", "Ciclos"]].map(([k, label]) => (
           <div key={k}>
-            <label className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>{label}</label>
+            <label className={`text-xs font-medium ${dark ? "text-stone-400" : "text-stone-500"}`}>{label}</label>
             <TextInput dark={dark} type="number" min="1" value={cfg[k]} onChange={(e) => set(k, e.target.value)} className="mt-1" />
           </div>
         ))}
@@ -563,42 +644,42 @@ function Workouts({ dark, data, setData, search }) {
       <SectionTitle dark={dark} icon={Dumbbell} title="Entrenamientos" />
       <div className="space-y-3">
         {list.map((w) => (
-          <div key={w.id} className={`group rounded-xl border p-3 ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
+          <div key={w.id} className={`group rounded-xl border p-3 ${dark ? "border-stone-800" : "border-stone-100"}`}>
             <div className="flex items-center justify-between gap-2">
-              <div className={`font-medium text-sm flex-1 ${dark ? "text-zinc-100" : "text-zinc-800"}`}>
+              <div className={`font-medium text-sm flex-1 ${dark ? "text-stone-100" : "text-stone-800"}`}>
                 <InlineEdit dark={dark} value={w.name} onSave={(t) => t && upd(w.id, "name", t)} placeholder="Nombre" />
               </div>
               <button
                 onClick={() => upd(w.id, "done", !w.done)}
                 className={`text-xs font-medium px-2.5 py-1 rounded-full transition-colors ${
-                  w.done ? "bg-emerald-500 bg-opacity-10 text-emerald-500" : dark ? "bg-zinc-800 text-zinc-400" : "bg-zinc-100 text-zinc-500"
+                  w.done ? "bg-emerald-500 bg-opacity-10 text-emerald-500" : dark ? "bg-stone-800 text-stone-400" : "bg-stone-100 text-stone-500"
                 }`}
               >{w.done ? "Completado" : "Pendiente"}</button>
               <IconBtn dark={dark} onClick={() => del(w.id)} title="Eliminar"><Trash2 size={14} /></IconBtn>
             </div>
-            <div className={`flex items-center gap-2 mt-1 text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+            <div className={`flex items-center gap-2 mt-1 text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>
               <Clock size={12} />
               <input
                 type="number" min="1" value={w.duration}
                 onChange={(e) => upd(w.id, "duration", Number(e.target.value) || 0)}
-                className={`w-14 rounded-md border px-1.5 py-0.5 text-xs outline-none focus:border-indigo-500 ${
-                  dark ? "bg-zinc-950 border-zinc-800 text-zinc-300" : "bg-white border-zinc-200 text-zinc-600"
+                className={`w-14 rounded-md border px-1.5 py-0.5 text-xs outline-none focus:border-orange-500 ${
+                  dark ? "bg-stone-950 border-stone-800 text-stone-300" : "bg-white border-stone-200 text-stone-600"
                 }`}
               /> min
             </div>
-            <div className={`text-xs mt-1.5 ${dark ? "text-zinc-400" : "text-zinc-500"}`}>
+            <div className={`text-xs mt-1.5 ${dark ? "text-stone-400" : "text-stone-500"}`}>
               <InlineEdit dark={dark} value={w.desc} onSave={(t) => upd(w.id, "desc", t)} placeholder="Añade una descripción…" />
             </div>
           </div>
         ))}
         {list.length === 0 && (
-          <p className={`text-sm py-2 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>Sin entrenamientos programados.</p>
+          <p className={`text-sm py-2 ${dark ? "text-stone-600" : "text-stone-400"}`}>Sin entrenamientos programados.</p>
         )}
       </div>
       <div className="flex gap-2 mt-3 flex-wrap">
-        <button onClick={() => add("Running")} className="text-sm font-medium text-indigo-500 hover:text-indigo-400 flex items-center gap-1"><Plus size={14} /> Running</button>
-        <button onClick={() => add("Gimnasio")} className="text-sm font-medium text-indigo-500 hover:text-indigo-400 flex items-center gap-1"><Plus size={14} /> Gimnasio</button>
-        <button onClick={() => add()} className="text-sm font-medium text-indigo-500 hover:text-indigo-400 flex items-center gap-1"><Plus size={14} /> Otro</button>
+        <button onClick={() => add("Running")} className="text-sm font-medium text-orange-500 hover:text-orange-400 flex items-center gap-1"><Plus size={14} /> Running</button>
+        <button onClick={() => add("Gimnasio")} className="text-sm font-medium text-orange-500 hover:text-orange-400 flex items-center gap-1"><Plus size={14} /> Gimnasio</button>
+        <button onClick={() => add()} className="text-sm font-medium text-orange-500 hover:text-orange-400 flex items-center gap-1"><Plus size={14} /> Otro</button>
       </div>
     </Card>
   );
@@ -638,42 +719,86 @@ function Reading({ dark, data, setData }) {
   const setPlanned = (v) => setData((d) => ({ ...d, reading: { ...d.reading, plannedMinutes: Math.max(1, Number(v) || 1) } }));
   const done = day.readingMinutes || 0;
   const pct = (done / data.reading.plannedMinutes) * 100;
+  const finished = data.reading.finished || [];
+
+  const finishBook = () => {
+    const title = (data.reading.book || "").trim();
+    if (!title) return;
+    setData((d) => ({
+      ...d,
+      reading: {
+        ...d.reading,
+        book: "",
+        finished: [{ id: uid(), title, at: todayKey() }, ...(d.reading.finished || [])],
+      },
+    }));
+  };
+  const delFinished = (id) =>
+    setData((d) => ({ ...d, reading: { ...d.reading, finished: (d.reading.finished || []).filter((b) => b.id !== id) } }));
 
   return (
     <Card dark={dark}>
       <SectionTitle dark={dark} icon={BookOpen} title="Lectura" />
-      <div className={`text-sm font-medium mb-1 ${dark ? "text-zinc-100" : "text-zinc-800"}`}>
+      <div className={`text-sm font-medium mb-1 ${dark ? "text-stone-100" : "text-stone-800"}`}>
         <InlineEdit dark={dark} value={data.reading.book} onSave={setBook} placeholder="¿Qué libro estás leyendo?" />
       </div>
-      <div className={`flex items-center gap-2 text-xs mb-3 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+      <div className={`flex items-center gap-2 text-xs mb-3 ${dark ? "text-stone-500" : "text-stone-400"}`}>
         Meta diaria:
         <input type="number" min="1" value={data.reading.plannedMinutes} onChange={(e) => setPlanned(e.target.value)}
-          className={`w-14 rounded-md border px-1.5 py-0.5 text-xs outline-none focus:border-indigo-500 ${
-            dark ? "bg-zinc-950 border-zinc-800 text-zinc-300" : "bg-white border-zinc-200 text-zinc-600"
+          className={`w-14 rounded-md border px-1.5 py-0.5 text-xs outline-none focus:border-orange-500 ${
+            dark ? "bg-stone-950 border-stone-800 text-stone-300" : "bg-white border-stone-200 text-stone-600"
           }`} /> min
       </div>
       <Progress dark={dark} value={pct} color="bg-amber-500" />
-      <div className={`flex justify-between items-center text-xs mt-1.5 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+      <div className={`flex justify-between items-center text-xs mt-1.5 ${dark ? "text-stone-500" : "text-stone-400"}`}>
         <span className="flex items-center gap-1.5">
           Leído:
           <input type="number" min="0" value={done} onChange={(e) => setMinutes(e.target.value)}
-            className={`w-14 rounded-md border px-1.5 py-0.5 text-xs font-semibold outline-none focus:border-indigo-500 ${
-              dark ? "bg-zinc-950 border-zinc-800 text-zinc-200" : "bg-white border-zinc-200 text-zinc-700"
+            className={`w-14 rounded-md border px-1.5 py-0.5 text-xs font-semibold outline-none focus:border-orange-500 ${
+              dark ? "bg-stone-950 border-stone-800 text-stone-200" : "bg-white border-stone-200 text-stone-700"
             }`} />
           min
         </span>
         <span>{Math.min(100, Math.round(pct))}%</span>
       </div>
-      <div className="flex items-center gap-3 mt-4">
+      <div className="flex items-center gap-3 mt-4 flex-wrap">
         {running ? (
           <>
             <GhostBtn dark={dark} onClick={stop}><Square size={14} /> Detener</GhostBtn>
-            <span className={`text-xl font-bold tabular-nums ${dark ? "text-zinc-100" : "text-zinc-900"}`}>{fmtClock(elapsed)}</span>
+            <span className={`text-xl font-bold tabular-nums ${dark ? "text-stone-100" : "text-stone-900"}`}>{fmtClock(elapsed)}</span>
           </>
         ) : (
           <PrimaryBtn onClick={start} className="bg-amber-500 hover:bg-amber-400"><Play size={15} /> Iniciar lectura</PrimaryBtn>
         )}
+        {!running && (data.reading.book || "").trim() && (
+          <GhostBtn dark={dark} onClick={finishBook}><BookMarked size={14} /> Terminé el libro</GhostBtn>
+        )}
       </div>
+
+      {finished.length > 0 && (
+        <div className={`mt-5 pt-4 border-t ${dark ? "border-stone-800" : "border-stone-100"}`}>
+          <div className="flex items-center gap-1.5 mb-2">
+            <BookMarked size={13} className="text-amber-500" />
+            <span className={`text-xs font-semibold uppercase tracking-widest ${dark ? "text-stone-500" : "text-stone-400"}`}>
+              Leídos este año · {finished.length}
+            </span>
+          </div>
+          <div className="space-y-1">
+            {finished.map((b) => (
+              <div key={b.id} className={`group flex items-center justify-between gap-2 text-sm ${dark ? "text-stone-300" : "text-stone-600"}`}>
+                <span className="flex items-center gap-2 min-w-0">
+                  <Check size={13} className="text-emerald-500 shrink-0" />
+                  <span className="truncate">{b.title}</span>
+                </span>
+                <span className="flex items-center gap-2 shrink-0">
+                  <span className={`text-xs ${dark ? "text-stone-600" : "text-stone-400"}`}>{fmtDayShort(b.at)}</span>
+                  <IconBtn dark={dark} onClick={() => delFinished(b.id)} title="Quitar"><Trash2 size={13} /></IconBtn>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </Card>
   );
 }
@@ -693,7 +818,7 @@ function German({ dark, data, setData }) {
   return (
     <Card dark={dark} className={g.done ? "border-l-4 border-l-emerald-500" : ""}>
       <SectionTitle dark={dark} icon={Languages} title="Alemán" />
-      <p className={`text-sm mb-3 ${dark ? "text-zinc-300" : "text-zinc-700"}`}>¿Estudiaste alemán?</p>
+      <p className={`text-sm mb-3 ${dark ? "text-stone-300" : "text-stone-700"}`}>¿Estudiaste alemán?</p>
 
       <div className="flex gap-2">
         <button
@@ -701,7 +826,7 @@ function German({ dark, data, setData }) {
           className={`flex-1 rounded-xl border px-4 py-2.5 text-sm font-medium transition-all active:scale-95 ${
             g.done
               ? "bg-emerald-500 border-emerald-500 text-white"
-              : dark ? "border-zinc-700 text-zinc-300 hover:bg-zinc-800" : "border-zinc-200 text-zinc-600 hover:bg-zinc-50"
+              : dark ? "border-stone-700 text-stone-300 hover:bg-stone-800" : "border-stone-200 text-stone-600 hover:bg-stone-50"
           }`}
         >
           <span className="inline-flex items-center gap-1.5"><Check size={15} /> Sí</span>
@@ -710,8 +835,8 @@ function German({ dark, data, setData }) {
           onClick={() => set({ done: false, minutes: 0 })}
           className={`flex-1 rounded-xl border px-4 py-2.5 text-sm font-medium transition-all active:scale-95 ${
             !g.done
-              ? dark ? "bg-zinc-800 border-zinc-700 text-zinc-200" : "bg-zinc-100 border-zinc-200 text-zinc-700"
-              : dark ? "border-zinc-700 text-zinc-400 hover:bg-zinc-800" : "border-zinc-200 text-zinc-500 hover:bg-zinc-50"
+              ? dark ? "bg-stone-800 border-stone-700 text-stone-200" : "bg-stone-100 border-stone-200 text-stone-700"
+              : dark ? "border-stone-700 text-stone-400 hover:bg-stone-800" : "border-stone-200 text-stone-500 hover:bg-stone-50"
           }`}
         >
           <span className="inline-flex items-center gap-1.5"><X size={15} /> Todavía no</span>
@@ -719,20 +844,20 @@ function German({ dark, data, setData }) {
       </div>
 
       {g.done && (
-        <div className={`flex items-center gap-2 text-xs mt-3 ${dark ? "text-zinc-400" : "text-zinc-500"}`}>
+        <div className={`flex items-center gap-2 text-xs mt-3 ${dark ? "text-stone-400" : "text-stone-500"}`}>
           Minutos
           <input type="number" min="0" value={g.minutes ?? 0} onChange={(e) => set({ minutes: Math.max(0, Number(e.target.value) || 0) })}
-            className={`w-16 rounded-md border px-1.5 py-0.5 text-xs font-semibold outline-none focus:border-indigo-500 ${
-              dark ? "bg-zinc-950 border-zinc-800 text-zinc-200" : "bg-white border-zinc-200 text-zinc-700"
+            className={`w-16 rounded-md border px-1.5 py-0.5 text-xs font-semibold outline-none focus:border-orange-500 ${
+              dark ? "bg-stone-950 border-stone-800 text-stone-200" : "bg-white border-stone-200 text-stone-700"
             }`} />
         </div>
       )}
 
-      <div className={`flex items-center gap-2 text-xs mt-3 pt-3 border-t ${dark ? "text-zinc-500 border-zinc-800" : "text-zinc-400 border-zinc-100"}`}>
+      <div className={`flex items-center gap-2 text-xs mt-3 pt-3 border-t ${dark ? "text-stone-500 border-stone-800" : "text-stone-400 border-stone-100"}`}>
         Meta diaria
         <input type="number" min="1" value={meta} onChange={(e) => setMeta(e.target.value)}
-          className={`w-14 rounded-md border px-1.5 py-0.5 text-xs outline-none focus:border-indigo-500 ${
-            dark ? "bg-zinc-950 border-zinc-800 text-zinc-300" : "bg-white border-zinc-200 text-zinc-600"
+          className={`w-14 rounded-md border px-1.5 py-0.5 text-xs outline-none focus:border-orange-500 ${
+            dark ? "bg-stone-950 border-stone-800 text-stone-300" : "bg-white border-stone-200 text-stone-600"
           }`} /> min
       </div>
     </Card>
@@ -756,16 +881,16 @@ function Projects({ dark, data, setData, search }) {
   return (
     <Card dark={dark}>
       <SectionTitle dark={dark} icon={FolderKanban} title="Proyectos Activos"
-        right={<button onClick={add} className="text-sm font-medium text-indigo-500 hover:text-indigo-400 flex items-center gap-1"><Plus size={14} /> Nuevo</button>} />
+        right={<button onClick={add} className="text-sm font-medium text-orange-500 hover:text-orange-400 flex items-center gap-1"><Plus size={14} /> Nuevo</button>} />
       <div className="space-y-4">
         {list.map((p) => (
-          <div key={p.id} className={`rounded-xl border p-4 ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
+          <div key={p.id} className={`rounded-xl border p-4 ${dark ? "border-stone-800" : "border-stone-100"}`}>
             <div className="flex items-start justify-between gap-2">
               <div className="flex-1 min-w-0">
-                <div className={`font-semibold text-sm ${dark ? "text-zinc-100" : "text-zinc-800"}`}>
+                <div className={`font-semibold text-sm ${dark ? "text-stone-100" : "text-stone-800"}`}>
                   <InlineEdit dark={dark} value={p.name} onSave={(t) => t && upd(p.id, "name", t)} placeholder="Nombre" />
                 </div>
-                <div className={`text-xs mt-0.5 ${dark ? "text-zinc-400" : "text-zinc-500"}`}>
+                <div className={`text-xs mt-0.5 ${dark ? "text-stone-400" : "text-stone-500"}`}>
                   <InlineEdit dark={dark} value={p.desc} onSave={(t) => upd(p.id, "desc", t)} placeholder="Descripción del proyecto…" />
                 </div>
               </div>
@@ -782,12 +907,12 @@ function Projects({ dark, data, setData, search }) {
                     <button
                       onClick={() => upd(p.id, "stage", s)}
                       className={`text-xs px-2 py-1 rounded-lg font-medium transition-colors ${
-                        isActive ? "bg-indigo-600 text-white"
-                        : isDone ? "text-indigo-500 " + (dark ? "bg-indigo-950" : "bg-indigo-50")
-                        : dark ? "text-zinc-500 hover:bg-zinc-800" : "text-zinc-400 hover:bg-zinc-100"
+                        isActive ? "bg-orange-600 text-white"
+                        : isDone ? "text-orange-500 " + (dark ? "bg-orange-950" : "bg-orange-50")
+                        : dark ? "text-stone-500 hover:bg-stone-800" : "text-stone-400 hover:bg-stone-100"
                       }`}
                     >{s}</button>
-                    {i < STAGES.length - 1 && <ChevronRight size={11} className={dark ? "text-zinc-700" : "text-zinc-300"} />}
+                    {i < STAGES.length - 1 && <ChevronRight size={11} className={dark ? "text-stone-700" : "text-stone-300"} />}
                   </React.Fragment>
                 );
               })}
@@ -799,23 +924,23 @@ function Projects({ dark, data, setData, search }) {
               <input
                 type="number" min="0" max="100" value={p.progress}
                 onChange={(e) => upd(p.id, "progress", Math.min(100, Math.max(0, Number(e.target.value) || 0)))}
-                className={`w-14 rounded-md border px-1.5 py-0.5 text-xs outline-none text-right focus:border-indigo-500 ${
-                  dark ? "bg-zinc-950 border-zinc-800 text-zinc-300" : "bg-white border-zinc-200 text-zinc-600"
+                className={`w-14 rounded-md border px-1.5 py-0.5 text-xs outline-none text-right focus:border-orange-500 ${
+                  dark ? "bg-stone-950 border-stone-800 text-stone-300" : "bg-white border-stone-200 text-stone-600"
                 }`}
               />
-              <span className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>%</span>
-              <div className={`flex items-center gap-1 text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+              <span className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>%</span>
+              <div className={`flex items-center gap-1 text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>
                 <CalendarDays size={12} />
                 <input type="date" value={p.targetDate} onChange={(e) => upd(p.id, "targetDate", e.target.value)}
-                  className={`rounded-md border px-1.5 py-0.5 text-xs outline-none focus:border-indigo-500 ${
-                    dark ? "bg-zinc-950 border-zinc-800 text-zinc-300" : "bg-white border-zinc-200 text-zinc-600"
+                  className={`rounded-md border px-1.5 py-0.5 text-xs outline-none focus:border-orange-500 ${
+                    dark ? "bg-stone-950 border-stone-800 text-stone-300" : "bg-white border-stone-200 text-stone-600"
                   }`} />
               </div>
             </div>
           </div>
         ))}
         {list.length === 0 && (
-          <p className={`text-sm py-2 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>Crea tu primer proyecto para hacer seguimiento de su avance.</p>
+          <p className={`text-sm py-2 ${dark ? "text-stone-600" : "text-stone-400"}`}>Crea tu primer proyecto para hacer seguimiento de su avance.</p>
         )}
       </div>
     </Card>
@@ -832,22 +957,32 @@ function Rules({ dark, data, setData, search }) {
   const del = (id) => setData((d) => ({ ...d, rules: d.rules.filter((r) => r.id !== id) }));
   const list = data.rules.filter((r) => !search || r.text.toLowerCase().includes(search.toLowerCase()));
 
+  // Marcar/desmarcar una regla como cumplida HOY (se guarda en el día en curso).
+  const habits = data.current?.habits || {};
+  const toggle = (id) =>
+    setData((d) => ({ ...d, current: { ...d.current, habits: { ...(d.current.habits || {}), [id]: !(d.current.habits || {})[id] } } }));
+  const cumplidas = data.rules.filter((r) => habits[r.id]).length;
+
   return (
     <Card dark={dark}>
       <SectionTitle dark={dark} icon={ShieldCheck} title="No Negociables"
-        right={<span className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>{data.rules.length} reglas</span>} />
+        right={<span className={`text-xs font-semibold ${cumplidas === data.rules.length && data.rules.length ? "text-emerald-500" : dark ? "text-stone-500" : "text-stone-400"}`}>{cumplidas}/{data.rules.length} hoy</span>} />
       <div className="space-y-1">
         {list.map((r) => (
-          <div key={r.id} className={`group flex items-center gap-3 rounded-xl px-2 py-2 transition-colors ${dark ? "hover:bg-zinc-800" : "hover:bg-zinc-50"}`}>
-            <span className="shrink-0 w-1.5 h-1.5 rounded-full bg-emerald-500" />
-            <div className={`flex-1 text-sm font-medium ${dark ? "text-zinc-200" : "text-zinc-700"}`}>
+          <div key={r.id} className={`group flex items-center gap-3 rounded-xl px-2 py-2 transition-colors ${dark ? "hover:bg-stone-800" : "hover:bg-stone-50"}`}>
+            <button onClick={() => toggle(r.id)} className="shrink-0" title="Marcar como cumplida hoy">
+              {habits[r.id]
+                ? <CheckCircle2 size={18} className="text-emerald-500" />
+                : <Circle size={18} className={dark ? "text-stone-600" : "text-stone-300"} />}
+            </button>
+            <div className={`flex-1 text-sm font-medium ${habits[r.id] ? (dark ? "text-stone-400" : "text-stone-400") : dark ? "text-stone-200" : "text-stone-700"}`}>
               <InlineEdit dark={dark} value={r.text} onSave={(t) => t && edit(r.id, t)} placeholder="Regla…" />
             </div>
             <IconBtn dark={dark} onClick={() => del(r.id)} title="Eliminar"><Trash2 size={14} /></IconBtn>
           </div>
         ))}
         {list.length === 0 && (
-          <p className={`text-sm py-2 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>
+          <p className={`text-sm py-2 ${dark ? "text-stone-600" : "text-stone-400"}`}>
             Escribe aquí los principios que no negocias contigo misma.
           </p>
         )}
@@ -915,12 +1050,12 @@ function weekSummary(data, wk) {
   return { ...weekMetrics(data, wk), closed: false };
 }
 
-function MetricCard({ dark, label, value, sub, color = "text-indigo-500" }) {
+function MetricCard({ dark, label, value, sub, color = "text-orange-500" }) {
   return (
-    <div className={`rounded-xl border p-3 ${dark ? "border-zinc-800 bg-zinc-950" : "border-zinc-100 bg-zinc-50"}`}>
+    <div className={`rounded-xl border p-3 ${dark ? "border-stone-800 bg-stone-950" : "border-stone-100 bg-stone-50"}`}>
       <div className={`text-xl font-bold ${color}`}>{value}</div>
-      <div className={`text-xs mt-0.5 ${dark ? "text-zinc-400" : "text-zinc-500"}`}>{label}</div>
-      {sub && <div className={`text-xs ${dark ? "text-zinc-600" : "text-zinc-400"}`}>{sub}</div>}
+      <div className={`text-xs mt-0.5 ${dark ? "text-stone-400" : "text-stone-500"}`}>{label}</div>
+      {sub && <div className={`text-xs ${dark ? "text-stone-600" : "text-stone-400"}`}>{sub}</div>}
     </div>
   );
 }
@@ -966,7 +1101,7 @@ function WeekClose({ dark, data, setData, wk, live }) {
             {cerrada.rating && (
               <span className="flex items-center gap-0.5 ml-1">
                 {[1, 2, 3, 4, 5].map((n) => (
-                  <Star key={n} size={12} className={n <= cerrada.rating ? "text-amber-500 fill-amber-500" : dark ? "text-zinc-700" : "text-zinc-300"} />
+                  <Star key={n} size={12} className={n <= cerrada.rating ? "text-amber-500 fill-amber-500" : dark ? "text-stone-700" : "text-stone-300"} />
                 ))}
               </span>
             )}
@@ -974,9 +1109,9 @@ function WeekClose({ dark, data, setData, wk, live }) {
           <GhostBtn dark={dark} onClick={reabrir} className="!py-1 !px-3 text-xs">Reabrir</GhostBtn>
         </div>
         {cerrada.notes && (
-          <p className={`text-sm mt-2 ${dark ? "text-zinc-300" : "text-zinc-600"}`}>{cerrada.notes}</p>
+          <p className={`text-sm mt-2 ${dark ? "text-stone-300" : "text-stone-600"}`}>{cerrada.notes}</p>
         )}
-        <p className={`text-xs mt-2 ${dark ? "text-zinc-500" : "text-zinc-500"}`}>
+        <p className={`text-xs mt-2 ${dark ? "text-stone-500" : "text-stone-500"}`}>
           Estos números ya no cambian aunque edites días anteriores.
         </p>
       </div>
@@ -984,12 +1119,12 @@ function WeekClose({ dark, data, setData, wk, live }) {
   }
 
   return (
-    <div className={`rounded-xl border p-4 mb-5 ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
+    <div className={`rounded-xl border p-4 mb-5 ${dark ? "border-stone-800" : "border-stone-100"}`}>
       <div className="flex items-center gap-2 mb-1">
-        <Lock size={14} className="text-indigo-500" />
-        <span className={`text-sm font-semibold ${dark ? "text-zinc-200" : "text-zinc-800"}`}>Cerrar la semana</span>
+        <Lock size={14} className="text-orange-500" />
+        <span className={`text-sm font-semibold ${dark ? "text-stone-200" : "text-stone-800"}`}>Cerrar la semana</span>
       </div>
-      <p className={`text-xs mb-4 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+      <p className={`text-xs mb-4 ${dark ? "text-stone-500" : "text-stone-400"}`}>
         {esDomingo
           ? "Es domingo. Completa lo que la app no puede medir y congela la semana."
           : "Normalmente esto se hace el domingo, pero puedes cerrarla cuando quieras."}
@@ -997,23 +1132,23 @@ function WeekClose({ dark, data, setData, wk, live }) {
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <label className="block">
-          <span className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Sueño promedio (h)</span>
+          <span className={`text-xs font-medium ${dark ? "text-stone-400" : "text-stone-500"}`}>Sueño promedio (h)</span>
           <TextInput dark={dark} type="number" step="0.5" min="0" className="mt-1"
             placeholder={live.sleepAvg != null ? String(live.sleepAvg) : "7.5"}
             value={draft.sleepAvg} onChange={(e) => setDraft({ ...draft, sleepAvg: e.target.value })} />
         </label>
         <label className="block">
-          <span className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Pantalla al día (min)</span>
+          <span className={`text-xs font-medium ${dark ? "text-stone-400" : "text-stone-500"}`}>Pantalla al día (min)</span>
           <TextInput dark={dark} type="number" min="0" className="mt-1"
             placeholder={live.screenAvg != null ? String(live.screenAvg) : "180"}
             value={draft.screenAvg} onChange={(e) => setDraft({ ...draft, screenAvg: e.target.value })} />
         </label>
         <div>
-          <span className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>¿Cómo estuvo la semana?</span>
+          <span className={`text-xs font-medium ${dark ? "text-stone-400" : "text-stone-500"}`}>¿Cómo estuvo la semana?</span>
           <div className="flex gap-1 mt-2">
             {[1, 2, 3, 4, 5].map((n) => (
               <button key={n} onClick={() => setDraft({ ...draft, rating: n })} title={`${n} de 5`}>
-                <Star size={20} className={n <= draft.rating ? "text-amber-500 fill-amber-500" : dark ? "text-zinc-700 hover:text-zinc-500" : "text-zinc-300 hover:text-zinc-400"} />
+                <Star size={20} className={n <= draft.rating ? "text-amber-500 fill-amber-500" : dark ? "text-stone-700 hover:text-stone-500" : "text-stone-300 hover:text-stone-400"} />
               </button>
             ))}
           </div>
@@ -1021,7 +1156,7 @@ function WeekClose({ dark, data, setData, wk, live }) {
       </div>
 
       <label className="block mt-4">
-        <span className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Qué aprendiste o qué cambiarías</span>
+        <span className={`text-xs font-medium ${dark ? "text-stone-400" : "text-stone-500"}`}>Qué aprendiste o qué cambiarías</span>
         <TextInput dark={dark} className="mt-1" placeholder="Opcional, pero es lo que más sirve al releerlo…"
           value={draft.notes} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} />
       </label>
@@ -1075,7 +1210,7 @@ function WeeklyDashboard({ dark, data, setData }) {
   return (
     <Card dark={dark} className="col-span-1 lg:col-span-2">
       <SectionTitle dark={dark} icon={BarChart3} title={`Dashboard Semanal · ${wkNow}`}
-        right={<span className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+        right={<span className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>
           {mNow.daysCount ?? 0} {(mNow.daysCount ?? 0) === 1 ? "día registrado" : "días registrados"}
         </span>} />
 
@@ -1087,14 +1222,14 @@ function WeeklyDashboard({ dark, data, setData }) {
         <MetricCard dark={dark} label="Tiempo de pantalla" value={mNow.screenAvg != null ? fmtMin(mNow.screenAvg) : "—"} sub={mNow.closed ? "promedio diario" : "al cerrar la semana"} color="text-rose-500" />
         <MetricCard dark={dark} label="Running" value={mNow.run} sub="sesiones" color="text-emerald-500" />
         <MetricCard dark={dark} label="Gimnasio" value={mNow.gym} sub="sesiones" color="text-emerald-500" />
-        <MetricCard dark={dark} label="Trabajo profundo" value={`${mNow.deepHours} h`} color="text-indigo-500" />
+        <MetricCard dark={dark} label="Trabajo profundo" value={`${mNow.deepHours} h`} color="text-orange-500" />
         <MetricCard dark={dark} label="Lectura" value={fmtMin(mNow.readMin)} color="text-amber-500" />
         <MetricCard dark={dark} label="Alemán" value={`${mNow.germanDays ?? 0}/7`} sub="días" color="text-violet-500" />
         <MetricCard dark={dark} label="Cumplimiento" value={`${mNow.compliance}%`} sub={`${mNow.goalsDone ?? 0} de ${mNow.goalsTotal ?? 0} objetivos`} color={mNow.compliance >= 70 ? "text-emerald-500" : "text-amber-500"} />
       </div>
 
       {/* Comparación entre semanas */}
-      <h3 className={`text-xs font-semibold uppercase tracking-widest mt-6 mb-3 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+      <h3 className={`text-xs font-semibold uppercase tracking-widest mt-6 mb-3 ${dark ? "text-stone-500" : "text-stone-400"}`}>
         Comparación · actual vs anterior vs hace un mes
       </h3>
       <div style={{ width: "100%", height: 220 }}>
@@ -1105,7 +1240,7 @@ function WeeklyDashboard({ dark, data, setData }) {
             <YAxis tick={{ fontSize: 11, fill: axisColor }} axisLine={false} tickLine={false} />
             <Tooltip contentStyle={tipStyle} cursor={{ fill: dark ? "#27272a55" : "#f4f4f588" }} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
-            <Bar dataKey="Trabajo profundo (h)" fill="#6366f1" radius={[6, 6, 0, 0]} />
+            <Bar dataKey="Trabajo profundo (h)" fill="#f97316" radius={[6, 6, 0, 0]} />
             <Bar dataKey="Lectura (min)" fill="#f59e0b" radius={[6, 6, 0, 0]} />
             <Bar dataKey="Cumplimiento (%)" fill="#10b981" radius={[6, 6, 0, 0]} />
           </BarChart>
@@ -1113,10 +1248,10 @@ function WeeklyDashboard({ dark, data, setData }) {
       </div>
 
       {/* Histórico */}
-      <h3 className={`text-xs font-semibold uppercase tracking-widest mt-6 mb-1 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+      <h3 className={`text-xs font-semibold uppercase tracking-widest mt-6 mb-1 ${dark ? "text-stone-500" : "text-stone-400"}`}>
         Histórico semanal
       </h3>
-      <p className={`text-xs mb-3 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>
+      <p className={`text-xs mb-3 ${dark ? "text-stone-600" : "text-stone-400"}`}>
         Semana a semana. Las cerradas quedan congeladas; la actual se mueve hasta que la cierres.
       </p>
       <div style={{ width: "100%", height: 200 }}>
@@ -1127,7 +1262,7 @@ function WeeklyDashboard({ dark, data, setData }) {
             <YAxis tick={{ fontSize: 11, fill: axisColor }} axisLine={false} tickLine={false} />
             <Tooltip contentStyle={tipStyle} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
-            <Line type="monotone" dataKey="Trabajo profundo (h)" stroke="#6366f1" strokeWidth={2} dot={{ r: 3 }} />
+            <Line type="monotone" dataKey="Trabajo profundo (h)" stroke="#f97316" strokeWidth={2} dot={{ r: 3 }} />
             <Line type="monotone" dataKey="Lectura (min)" stroke="#f59e0b" strokeWidth={2} dot={{ r: 3 }} />
             <Line type="monotone" dataKey="Cumplimiento (%)" stroke="#10b981" strokeWidth={2} dot={{ r: 3 }} />
             <Line type="monotone" dataKey="Alemán (días)" stroke="#8b5cf6" strokeWidth={2} dot={{ r: 3 }} />
@@ -1135,7 +1270,7 @@ function WeeklyDashboard({ dark, data, setData }) {
         </ResponsiveContainer>
       </div>
       {historical.length === 0 && (
-        <p className={`text-sm text-center py-6 ${dark ? "text-zinc-600" : "text-zinc-400"}`}>
+        <p className={`text-sm text-center py-6 ${dark ? "text-stone-600" : "text-stone-400"}`}>
           Registra tu primer día y aquí empezará a construirse tu historia.
         </p>
       )}
@@ -1182,7 +1317,7 @@ function GeneralPanel({ dark, data, setData, saved }) {
           <GhostBtn dark={dark} onClick={() => fileRef.current?.click()}><Upload size={14} /> Importar datos</GhostBtn>
           <input ref={fileRef} type="file" accept=".json" onChange={importData} className="hidden" />
         </div>
-        <p className={`text-xs mt-4 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+        <p className={`text-xs mt-4 ${dark ? "text-stone-500" : "text-stone-400"}`}>
           Guardado automático en la nube {saved ? "✓ al día" : "…guardando"}. Tus datos se sincronizan entre todos tus dispositivos con tu cuenta, y el historial semanal nunca se sobrescribe.
         </p>
       </Card>
@@ -1237,10 +1372,10 @@ function RegisterDay({ dark, data, setData }) {
           <div className="flex items-center gap-2">
             <CheckCircle2 size={18} className="text-emerald-500" />
             <div>
-              <div className={`text-sm font-semibold ${dark ? "text-zinc-100" : "text-zinc-900"}`}>
+              <div className={`text-sm font-semibold ${dark ? "text-stone-100" : "text-stone-900"}`}>
                 Día registrado · {fmtDayLong(undo.current.forDate || todayKey())}
               </div>
-              <div className={`text-xs mt-0.5 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+              <div className={`text-xs mt-0.5 ${dark ? "text-stone-500" : "text-stone-400"}`}>
                 La mesa quedó limpia. Ahora estás planeando {fmtDayShort(data.current.forDate)}.
               </div>
             </div>
@@ -1257,7 +1392,7 @@ function RegisterDay({ dark, data, setData }) {
   return (
     <Card dark={dark}>
       <SectionTitle dark={dark} icon={Archive} title="Cerrar el día"
-        right={<span className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>{fmtDayLong(fd)}</span>} />
+        right={<span className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>{fmtDayLong(fd)}</span>} />
 
       {atraso >= 1 && (
         <div className={`flex items-start gap-2 rounded-xl border p-3 mb-4 ${dark ? "border-amber-900 bg-amber-950 bg-opacity-30" : "border-amber-200 bg-amber-50"}`}>
@@ -1271,19 +1406,19 @@ function RegisterDay({ dark, data, setData }) {
 
       <div className={`grid grid-cols-2 sm:grid-cols-5 gap-2 mb-4`}>
         {resumen.map((r) => (
-          <div key={r.label} className={`rounded-xl border px-3 py-2 ${dark ? "border-zinc-800 bg-zinc-950" : "border-zinc-100 bg-zinc-50"}`}>
-            <div className={`text-sm font-bold ${dark ? "text-zinc-100" : "text-zinc-900"}`}>{r.val}</div>
-            <div className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>{r.label}</div>
+          <div key={r.label} className={`rounded-xl border px-3 py-2 ${dark ? "border-stone-800 bg-stone-950" : "border-stone-100 bg-stone-50"}`}>
+            <div className={`text-sm font-bold ${dark ? "text-stone-100" : "text-stone-900"}`}>{r.val}</div>
+            <div className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>{r.label}</div>
           </div>
         ))}
       </div>
 
       {confirming ? (
-        <div className={`rounded-xl border p-4 ${dark ? "border-indigo-800 bg-indigo-950 bg-opacity-30" : "border-indigo-200 bg-indigo-50"}`}>
-          <p className={`text-sm font-medium ${dark ? "text-zinc-100" : "text-zinc-900"}`}>
+        <div className={`rounded-xl border p-4 ${dark ? "border-orange-800 bg-orange-950 bg-opacity-30" : "border-orange-200 bg-orange-50"}`}>
+          <p className={`text-sm font-medium ${dark ? "text-stone-100" : "text-stone-900"}`}>
             Se guardará todo esto como tu {fmtDayLong(fd)}.
           </p>
-          <p className={`text-xs mt-1 ${dark ? "text-zinc-400" : "text-zinc-600"}`}>
+          <p className={`text-xs mt-1 ${dark ? "text-stone-400" : "text-stone-600"}`}>
             La página queda en blanco para que escribas el plan de {fmtDayShort(nextDayKey(fd))}.
             Tu objetivo de la semana, proyectos y reglas se quedan donde están.
           </p>
@@ -1298,12 +1433,12 @@ function RegisterDay({ dark, data, setData }) {
             onClick={() => setConfirming(true)}
             disabled={vacio}
             className={`w-full inline-flex items-center justify-center gap-2 rounded-xl text-white text-sm font-semibold px-4 py-3 transition-all ${
-              vacio ? "bg-zinc-400 cursor-not-allowed opacity-50" : "bg-indigo-600 hover:bg-indigo-500 active:scale-[.99]"
+              vacio ? "bg-stone-400 cursor-not-allowed opacity-50" : "bg-orange-600 hover:bg-orange-500 active:scale-[.99]"
             }`}
           >
             <Archive size={16} /> Registrar día · {fmtDayShort(fd)}
           </button>
-          <p className={`text-xs mt-2 text-center ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+          <p className={`text-xs mt-2 text-center ${dark ? "text-stone-500" : "text-stone-400"}`}>
             {vacio
               ? "Todavía no hay nada que registrar."
               : "Archiva el día y deja la página lista para el siguiente."}
@@ -1353,22 +1488,22 @@ function AlarmSettings({ dark, data, setData }) {
         right={
           <button
             onClick={() => { if (!a.enabled) askNotifPermission(); set({ enabled: !a.enabled }); }}
-            className={`relative w-10 h-5 rounded-full transition-colors ${a.enabled ? "bg-indigo-600" : dark ? "bg-zinc-700" : "bg-zinc-300"}`}
+            className={`relative w-10 h-5 rounded-full transition-colors ${a.enabled ? "bg-orange-600" : dark ? "bg-stone-700" : "bg-stone-300"}`}
           >
             <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${a.enabled ? "left-[22px]" : "left-0.5"}`} />
           </button>
         } />
 
-      <p className={`text-sm ${dark ? "text-zinc-400" : "text-zinc-500"}`}>
+      <p className={`text-sm ${dark ? "text-stone-400" : "text-stone-500"}`}>
         Si a la hora que elijas todavía te falta algo del día, la app te avisa.
       </p>
 
-      <div className={`flex items-center gap-2 mt-4 text-sm ${dark ? "text-zinc-300" : "text-zinc-700"}`}>
+      <div className={`flex items-center gap-2 mt-4 text-sm ${dark ? "text-stone-300" : "text-stone-700"}`}>
         Avísame a las
         <select
           value={a.hour ?? 19} onChange={(e) => set({ hour: Number(e.target.value) })}
-          className={`rounded-lg border px-2 py-1.5 text-sm font-semibold outline-none focus:border-indigo-500 ${
-            dark ? "bg-zinc-950 border-zinc-800 text-zinc-100" : "bg-white border-zinc-200 text-zinc-800"
+          className={`rounded-lg border px-2 py-1.5 text-sm font-semibold outline-none focus:border-orange-500 ${
+            dark ? "bg-stone-950 border-stone-800 text-stone-100" : "bg-white border-stone-200 text-stone-800"
           }`}
         >
           {[18, 19, 20, 21, 22].map((h) => (
@@ -1378,23 +1513,23 @@ function AlarmSettings({ dark, data, setData }) {
       </div>
 
       <div className="mt-4 space-y-2">
-        <p className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Recordarme sobre:</p>
+        <p className={`text-xs font-medium ${dark ? "text-stone-400" : "text-stone-500"}`}>Recordarme sobre:</p>
         {[["goals", "Objetivos del día"], ["reading", "Lectura"], ["german", "Alemán"]].map(([k, label]) => (
-          <label key={k} className={`flex items-center gap-2.5 text-sm cursor-pointer ${dark ? "text-zinc-300" : "text-zinc-700"}`}>
+          <label key={k} className={`flex items-center gap-2.5 text-sm cursor-pointer ${dark ? "text-stone-300" : "text-stone-700"}`}>
             <button onClick={() => set({ [k]: !a[k] })} className="shrink-0">
-              {a[k] ? <CheckCircle2 size={18} className="text-indigo-500" /> : <Circle size={18} className={dark ? "text-zinc-600" : "text-zinc-300"} />}
+              {a[k] ? <CheckCircle2 size={18} className="text-orange-500" /> : <Circle size={18} className={dark ? "text-stone-600" : "text-stone-300"} />}
             </button>
             {label}
           </label>
         ))}
       </div>
 
-      <div className={`mt-4 pt-4 border-t ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
-        <p className={`text-xs font-medium mb-1.5 ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Ahora mismo te falta:</p>
+      <div className={`mt-4 pt-4 border-t ${dark ? "border-stone-800" : "border-stone-100"}`}>
+        <p className={`text-xs font-medium mb-1.5 ${dark ? "text-stone-400" : "text-stone-500"}`}>Ahora mismo te falta:</p>
         {pend.length === 0 ? (
           <p className="text-sm text-emerald-500 flex items-center gap-1.5"><Check size={15} /> Nada. Vas al día.</p>
         ) : (
-          <ul className={`text-sm space-y-0.5 ${dark ? "text-zinc-300" : "text-zinc-700"}`}>
+          <ul className={`text-sm space-y-0.5 ${dark ? "text-stone-300" : "text-stone-700"}`}>
             {pend.map((p) => <li key={p} className="flex items-center gap-1.5"><span className="w-1 h-1 rounded-full bg-amber-500" /> {p}</li>)}
           </ul>
         )}
@@ -1434,9 +1569,9 @@ function PushControl({ dark }) {
   };
 
   return (
-    <div className={`mt-4 pt-4 border-t ${dark ? "border-zinc-800" : "border-zinc-100"}`}>
-      <p className={`text-xs font-medium ${dark ? "text-zinc-400" : "text-zinc-500"}`}>Con la app cerrada</p>
-      <p className={`text-xs mt-1 mb-3 ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+    <div className={`mt-4 pt-4 border-t ${dark ? "border-stone-800" : "border-stone-100"}`}>
+      <p className={`text-xs font-medium ${dark ? "text-stone-400" : "text-stone-500"}`}>Con la app cerrada</p>
+      <p className={`text-xs mt-1 mb-3 ${dark ? "text-stone-500" : "text-stone-400"}`}>
         Se activa en cada dispositivo por separado. Hazlo también en el celular.
       </p>
 
@@ -1447,7 +1582,7 @@ function PushControl({ dark }) {
       )}
 
       {pushConfigured && estado === "unsupported" && (
-        <p className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>
+        <p className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>
           Este navegador no admite recordatorios. En iPhone, instala la app en la pantalla de inicio y ábrela desde ahí.
         </p>
       )}
@@ -1485,18 +1620,10 @@ function PushControl({ dark }) {
    ============================================================ */
 
 const TABS = [
-  { id: "dashboard", label: "Dashboard", icon: BarChart3 },
-  { id: "general", label: "General", icon: Settings },
-  { id: "semanal", label: "Objetivo semanal", icon: Target },
-  { id: "dia", label: "Metas del día", icon: Flame },
-  { id: "deep", label: "Trabajo profundo", icon: TimerIcon },
-  { id: "entreno", label: "Entrenamientos", icon: Dumbbell },
-  { id: "lectura", label: "Lectura", icon: BookOpen },
-  { id: "aleman", label: "Alemán", icon: Languages },
+  { id: "dashboard", label: "Hoy", icon: Flame },
+  { id: "metricas", label: "Métricas", icon: TrendingUp },
   { id: "proyectos", label: "Proyectos", icon: FolderKanban },
-  { id: "metricas", label: "Dashboard semanal", icon: TrendingUp },
-  { id: "reglas", label: "Reglas", icon: ShieldCheck },
-  { id: "alarma", label: "Recordatorio", icon: AlarmClock },
+  { id: "ajustes", label: "Ajustes", icon: Settings },
 ];
 
 function Sidebar({ dark, tab, setTab, open, setOpen }) {
@@ -1506,16 +1633,16 @@ function Sidebar({ dark, tab, setTab, open, setOpen }) {
       {open && <div className="fixed inset-0 bg-black bg-opacity-40 z-30 lg:hidden" onClick={() => setOpen(false)} />}
       <aside
         className={`fixed lg:static z-40 h-full w-60 shrink-0 border-r flex flex-col transition-transform duration-300 ${
-          dark ? "bg-zinc-950 border-zinc-800" : "bg-white border-zinc-200"
+          dark ? "bg-stone-950 border-stone-800" : "bg-white border-stone-200"
         } ${open ? "translate-x-0" : "-translate-x-full lg:translate-x-0"}`}
       >
         <div className="flex items-center gap-2.5 px-5 py-5">
-          <div className="w-8 h-8 rounded-xl bg-indigo-600 flex items-center justify-center">
+          <div className="w-8 h-8 rounded-xl bg-orange-600 flex items-center justify-center">
             <Flame size={16} className="text-white" />
           </div>
           <div>
-            <div className={`text-sm font-bold leading-tight ${dark ? "text-zinc-100" : "text-zinc-900"}`}>Enfoque</div>
-            <div className={`text-xs ${dark ? "text-zinc-500" : "text-zinc-400"}`}>Productividad personal</div>
+            <div className={`text-sm font-bold leading-tight ${dark ? "text-stone-100" : "text-stone-900"}`}>Enfoque</div>
+            <div className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>Productividad personal</div>
           </div>
         </div>
         <nav className="flex-1 px-3 space-y-0.5 overflow-y-auto pb-4">
@@ -1525,17 +1652,267 @@ function Sidebar({ dark, tab, setTab, open, setOpen }) {
               onClick={() => { setTab(t.id); setOpen(false); }}
               className={`w-full flex items-center gap-2.5 rounded-xl px-3 py-2 text-sm font-medium transition-colors ${
                 tab === t.id
-                  ? dark ? "bg-zinc-800 text-zinc-100" : "bg-zinc-100 text-zinc-900"
-                  : dark ? "text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200" : "text-zinc-500 hover:bg-zinc-50 hover:text-zinc-800"
+                  ? dark ? "bg-stone-800 text-stone-100" : "bg-stone-100 text-stone-900"
+                  : dark ? "text-stone-400 hover:bg-stone-900 hover:text-stone-200" : "text-stone-500 hover:bg-stone-50 hover:text-stone-800"
               }`}
             >
-              <t.icon size={15} className={tab === t.id ? "text-indigo-500" : ""} />
+              <t.icon size={15} className={tab === t.id ? "text-orange-500" : ""} />
               {t.label}
             </button>
           ))}
         </nav>
       </aside>
     </>
+  );
+}
+
+/* ============================================================
+   RESUMEN DE HOY — el pulso del día de un vistazo
+   ============================================================ */
+
+function TodaySummary({ dark, data }) {
+  const c = data.current || {};
+  const goals = c.goals || [];
+  const gDone = goals.filter((g) => g.done).length;
+  const readDone = c.readingMinutes || 0;
+  const readMeta = data.reading?.plannedMinutes || 0;
+  const deep = c.deepWorkMinutes || 0;
+  const wk = c.workouts || [];
+  const wDone = wk.filter((w) => w.done).length;
+  const aleman = !!c.german?.done;
+
+  const items = [
+    { icon: Flame,     label: "Objetivos", val: `${gDone}/${goals.length}`, ok: goals.length > 0 && gDone === goals.length, color: "text-orange-500" },
+    { icon: BookOpen,  label: "Lectura",   val: `${readDone}/${readMeta}m`, ok: readMeta > 0 && readDone >= readMeta,      color: "text-amber-500" },
+    { icon: TimerIcon, label: "Profundo",  val: fmtMin(deep),               ok: deep > 0,                                   color: "text-orange-500" },
+    { icon: Dumbbell,  label: "Entreno",   val: wk.length ? `${wDone}/${wk.length}` : "—", ok: wk.length > 0 && wDone > 0, color: "text-emerald-500" },
+    { icon: Languages, label: "Alemán",    val: aleman ? "Sí" : "No",       ok: aleman,                                     color: "text-violet-500" },
+  ];
+
+  const pillars = [
+    goals.length ? gDone / goals.length : 0,
+    readMeta ? Math.min(1, readDone / readMeta) : 0,
+    wk.length ? (wDone > 0 ? 1 : 0) : 0,
+    aleman ? 1 : 0,
+  ];
+  const overall = Math.round((pillars.reduce((a, b) => a + b, 0) / pillars.length) * 100);
+
+  const streaks = [
+    { label: "Objetivos", n: trailingStreak(data, metGoals) },
+    { label: "Lectura",   n: trailingStreak(data, metReading) },
+    { label: "Entreno",   n: trailingStreak(data, metWorkout) },
+    { label: "Alemán",    n: trailingStreak(data, metGerman) },
+  ].filter((s) => s.n >= 2);
+
+  return (
+    <Card dark={dark}>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <TrendingUp size={16} className="text-orange-500" />
+          <span className={`text-sm font-semibold ${dark ? "text-stone-100" : "text-stone-800"}`}>Hoy · {overall}% del día</span>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          {streaks.map((s) => (
+            <span key={s.label} title={`${s.n} días seguidos: ${s.label}`}
+              className={`inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full ${dark ? "bg-orange-950 text-orange-400" : "bg-orange-50 text-orange-600"}`}>
+              <Flame size={11} /> {s.n} {s.label}
+            </span>
+          ))}
+        </div>
+      </div>
+      <div className="mb-4"><Progress dark={dark} value={overall} color="bg-orange-500" /></div>
+      <div className="grid grid-cols-3 sm:grid-cols-5 gap-2">
+        {items.map((it) => (
+          <div key={it.label} className={`rounded-xl border px-3 py-2.5 flex flex-col gap-1 ${dark ? "border-stone-800 bg-stone-950" : "border-stone-100 bg-stone-50"}`}>
+            <div className="flex items-center justify-between">
+              <it.icon size={14} className={it.color} />
+              {it.ok && <Check size={13} className="text-emerald-500" />}
+            </div>
+            <div className={`text-sm font-bold ${dark ? "text-stone-100" : "text-stone-900"}`}>{it.val}</div>
+            <div className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>{it.label}</div>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+/* ============================================================
+   DIARIO — reflexión del día (y relees la de ayer)
+   ============================================================ */
+
+function DailyJournal({ dark, data, setData }) {
+  const c = data.current;
+  const note = c.note || "";
+  const set = (v) => setData((d) => ({ ...d, current: { ...d.current, note: v } }));
+  const prev = data.days?.[prevDayKey(c.forDate || todayKey())];
+  const prevNote = prev?.note;
+
+  return (
+    <Card dark={dark}>
+      <SectionTitle dark={dark} icon={NotebookPen} title="Diario del día" />
+      {prevNote && (
+        <div className={`rounded-xl border p-3 mb-3 ${dark ? "border-stone-800 bg-stone-950" : "border-stone-100 bg-stone-50"}`}>
+          <p className={`text-xs font-medium mb-1 ${dark ? "text-stone-500" : "text-stone-400"}`}>Ayer escribiste</p>
+          <p className={`text-sm italic ${dark ? "text-stone-300" : "text-stone-600"}`}>“{prevNote}”</p>
+        </div>
+      )}
+      <textarea
+        value={note} onChange={(e) => set(e.target.value)} rows={4}
+        placeholder="¿Cómo estuvo el día? Qué aprendiste, qué sentiste, qué cambiarías…"
+        className={`w-full rounded-xl border px-3 py-2.5 text-sm outline-none focus:border-orange-500 resize-none transition-colors ${
+          dark ? "bg-stone-950 border-stone-800 text-stone-100 placeholder-stone-600" : "bg-white border-stone-200 text-stone-800 placeholder-stone-400"
+        }`}
+      />
+      <p className={`text-xs mt-2 ${dark ? "text-stone-600" : "text-stone-400"}`}>
+        Se guarda con el día. Mañana lo verás aquí arriba para no perder el hilo.
+      </p>
+    </Card>
+  );
+}
+
+/* ============================================================
+   CONSTANCIA — mapa de rachas (no rompas la cadena)
+   ============================================================ */
+
+function ConstanciaMap({ dark, data }) {
+  const rows = constancyRows(data, 35);
+  const on = "#f97316";
+  const off = dark ? "#292524" : "#f5f5f4";
+  const miss = dark ? "#44403c" : "#e7e5e4";
+
+  return (
+    <Card dark={dark}>
+      <SectionTitle dark={dark} icon={Flame} title="Constancia · últimas 5 semanas" />
+      <div className="space-y-2">
+        {rows.map((r) => (
+          <div key={r.key} className="flex items-center gap-2">
+            <span className={`w-20 shrink-0 text-xs ${dark ? "text-stone-400" : "text-stone-500"}`}>{r.label}</span>
+            <div className="flex-1 flex gap-[3px]">
+              {r.cells.map((v, i) => (
+                <div key={i} title={v === null ? "sin registro" : v ? "cumplido" : "no"}
+                  className="flex-1 rounded-[3px]"
+                  style={{ aspectRatio: "1", maxWidth: 15, background: v === null ? off : v ? on : miss }} />
+              ))}
+            </div>
+            <span className={`shrink-0 w-11 text-right inline-flex items-center justify-end gap-1 text-xs font-semibold ${r.streak >= 3 ? "text-orange-500" : dark ? "text-stone-600" : "text-stone-400"}`}>
+              <Flame size={12} /> {r.streak}
+            </span>
+          </div>
+        ))}
+      </div>
+      <p className={`text-xs mt-3 ${dark ? "text-stone-600" : "text-stone-400"}`}>
+        Cada cuadro es un día. Los llenos son días cumplidos; la llama marca tu racha actual.
+      </p>
+    </Card>
+  );
+}
+
+/* ============================================================
+   CELEBRACIÓN — cuando completas todos los objetivos del día
+   ============================================================ */
+
+function Celebration({ data }) {
+  const [show, setShow] = useState(false);
+  const doneFor = useRef(null);
+  const c = data.current || {};
+  const goals = c.goals || [];
+  const allDone = goals.length > 0 && goals.every((g) => g.done);
+
+  useEffect(() => {
+    const key = c.forDate || todayKey();
+    if (allDone && doneFor.current !== key) {
+      doneFor.current = key;
+      setShow(true);
+      playChime();
+      const t = setTimeout(() => setShow(false), 2600);
+      return () => clearTimeout(t);
+    }
+    if (!allDone && doneFor.current === key) doneFor.current = null;
+  }, [allDone, c.forDate]);
+
+  if (!show) return null;
+  const colors = ["#f97316", "#f59e0b", "#10b981", "#8b5cf6", "#ea580c"];
+  return (
+    <div className="fixed inset-0 z-50 pointer-events-none flex items-center justify-center">
+      <div className="relative">
+        {Array.from({ length: 16 }).map((_, i) => (
+          <span key={i} className="enfoque-confetti"
+            style={{
+              left: `${(Math.random() * 220 - 110)}px`, top: "-10px",
+              background: colors[i % colors.length],
+              animationDelay: `${Math.random() * 0.3}s`,
+            }} />
+        ))}
+        <div className="enfoque-pop flex flex-col items-center gap-2 rounded-2xl bg-orange-600 px-8 py-6 text-white shadow-2xl">
+          <Trophy size={34} />
+          <span className="text-lg font-bold">¡Día completo!</span>
+          <span className="text-sm text-orange-100">Cumpliste todos tus objetivos.</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   RUTINAS RECURRENTES — plantillas que se cargan cada mañana
+   ============================================================ */
+
+function RecurringManager({ dark, data, setData }) {
+  const rec = data.recurring || { goals: [], workouts: [] };
+  const setRec = (patch) => setData((d) => ({ ...d, recurring: { ...d.recurring, ...patch } }));
+
+  const addGoal = () => setRec({ goals: [...(rec.goals || []), { id: uid(), text: "Nuevo objetivo diario" }] });
+  const editGoal = (id, text) => setRec({ goals: rec.goals.map((g) => (g.id === id ? { ...g, text } : g)) });
+  const delGoal = (id) => setRec({ goals: rec.goals.filter((g) => g.id !== id) });
+
+  const addW = () => setRec({ workouts: [...(rec.workouts || []), { id: uid(), name: "Entrenamiento", duration: 45 }] });
+  const editW = (id, k, v) => setRec({ workouts: rec.workouts.map((w) => (w.id === id ? { ...w, [k]: v } : w)) });
+  const delW = (id) => setRec({ workouts: rec.workouts.filter((w) => w.id !== id) });
+
+  return (
+    <Card dark={dark}>
+      <SectionTitle dark={dark} icon={Repeat} title="Rutinas recurrentes" />
+      <p className={`text-sm mb-4 ${dark ? "text-stone-400" : "text-stone-500"}`}>
+        Lo que pongas aquí aparece solo cada mañana en tu día. Si un día no aplica, puedes borrarlo del día sin borrar la plantilla.
+      </p>
+
+      <p className={`text-xs font-semibold uppercase tracking-widest mb-2 ${dark ? "text-stone-500" : "text-stone-400"}`}>Objetivos diarios</p>
+      <div className="space-y-1">
+        {(rec.goals || []).map((g) => (
+          <div key={g.id} className={`group flex items-center gap-3 rounded-xl px-2 py-2 ${dark ? "hover:bg-stone-800" : "hover:bg-stone-50"}`}>
+            <Flame size={14} className="text-orange-500 shrink-0" />
+            <div className={`flex-1 text-sm ${dark ? "text-stone-200" : "text-stone-700"}`}>
+              <InlineEdit dark={dark} value={g.text} onSave={(t) => t && editGoal(g.id, t)} placeholder="Objetivo…" />
+            </div>
+            <IconBtn dark={dark} onClick={() => delGoal(g.id)} title="Quitar de la plantilla"><Trash2 size={14} /></IconBtn>
+          </div>
+        ))}
+      </div>
+      <button onClick={addGoal} className="mt-2 flex items-center gap-1.5 text-sm font-medium text-orange-500 hover:text-orange-400 transition-colors">
+        <Plus size={15} /> Agregar objetivo recurrente
+      </button>
+
+      <p className={`text-xs font-semibold uppercase tracking-widest mb-2 mt-5 ${dark ? "text-stone-500" : "text-stone-400"}`}>Entrenamientos</p>
+      <div className="space-y-1">
+        {(rec.workouts || []).map((w) => (
+          <div key={w.id} className={`group flex items-center gap-3 rounded-xl px-2 py-2 ${dark ? "hover:bg-stone-800" : "hover:bg-stone-50"}`}>
+            <Dumbbell size={14} className="text-emerald-500 shrink-0" />
+            <div className={`flex-1 text-sm ${dark ? "text-stone-200" : "text-stone-700"}`}>
+              <InlineEdit dark={dark} value={w.name} onSave={(t) => t && editW(w.id, "name", t)} placeholder="Nombre…" />
+            </div>
+            <input type="number" min="1" value={w.duration}
+              onChange={(e) => editW(w.id, "duration", Number(e.target.value) || 0)}
+              className={`w-14 rounded-md border px-1.5 py-0.5 text-xs outline-none focus:border-orange-500 ${dark ? "bg-stone-950 border-stone-800 text-stone-300" : "bg-white border-stone-200 text-stone-600"}`} />
+            <span className={`text-xs ${dark ? "text-stone-500" : "text-stone-400"}`}>min</span>
+            <IconBtn dark={dark} onClick={() => delW(w.id)} title="Quitar de la plantilla"><Trash2 size={14} /></IconBtn>
+          </div>
+        ))}
+      </div>
+      <button onClick={addW} className="mt-2 flex items-center gap-1.5 text-sm font-medium text-emerald-500 hover:text-emerald-400 transition-colors">
+        <Plus size={15} /> Agregar entrenamiento recurrente
+      </button>
+    </Card>
   );
 }
 
@@ -1563,41 +1940,42 @@ export default function DashboardApp({ data, setData, saved, userEmail, onSignOu
   const today = fmtDayLong(fd);
 
   return (
-    <div className={`min-h-screen flex transition-colors duration-300 ${dark ? "bg-zinc-950 dark" : "bg-zinc-50"}`}>
+    <div className={`min-h-screen flex transition-colors duration-300 ${dark ? "bg-stone-950 dark" : "bg-stone-50"}`}>
+      <Celebration data={data} />
       <Sidebar dark={dark} tab={tab} setTab={setTab} open={menuOpen} setOpen={setMenuOpen} />
 
       <main className="flex-1 min-w-0 flex flex-col h-screen overflow-y-auto">
         {/* Encabezado */}
         <header className={`sticky top-0 z-20 flex items-center gap-3 px-5 py-3.5 border-b backdrop-blur ${
-          dark ? "border-zinc-800" : "border-zinc-200"
+          dark ? "border-stone-800" : "border-stone-200"
         }`} style={{ backgroundColor: dark ? "rgba(9,9,11,.85)" : "rgba(250,250,250,.85)" }}>
-          <button onClick={() => setMenuOpen(true)} className={`lg:hidden ${dark ? "text-zinc-300" : "text-zinc-600"}`}>
+          <button onClick={() => setMenuOpen(true)} className={`lg:hidden ${dark ? "text-stone-300" : "text-stone-600"}`}>
             <Menu size={20} />
           </button>
           <div className="flex-1 min-w-0 flex items-center gap-2">
-            <h1 className={`text-base font-bold capitalize truncate ${dark ? "text-zinc-100" : "text-zinc-900"}`}>{today}</h1>
+            <h1 className={`text-base font-bold capitalize truncate ${dark ? "text-stone-100" : "text-stone-900"}`}>{today}</h1>
             {!esHoy && (
-              <span className="shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full bg-indigo-600 bg-opacity-10 text-indigo-500">
+              <span className="shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full bg-orange-600 bg-opacity-10 text-orange-500">
                 Planeando
               </span>
             )}
           </div>
-          <div className={`hidden sm:flex items-center gap-2 rounded-xl border px-3 py-1.5 ${dark ? "border-zinc-800 bg-zinc-900" : "border-zinc-200 bg-white"}`}>
-            <Search size={14} className="text-zinc-400" />
+          <div className={`flex items-center gap-2 rounded-xl border px-3 py-1.5 ${dark ? "border-stone-800 bg-stone-900" : "border-stone-200 bg-white"}`}>
+            <Search size={14} className="text-stone-400 shrink-0" />
             <input
               value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar…"
-              className={`bg-transparent outline-none text-sm w-36 ${dark ? "text-zinc-200 placeholder-zinc-600" : "text-zinc-700 placeholder-zinc-400"}`}
+              className={`bg-transparent outline-none text-sm w-24 sm:w-36 ${dark ? "text-stone-200 placeholder-stone-600" : "text-stone-700 placeholder-stone-400"}`}
             />
-            {search && <button onClick={() => setSearch("")}><X size={13} className="text-zinc-400" /></button>}
+            {search && <button onClick={() => setSearch("")}><X size={13} className="text-stone-400" /></button>}
           </div>
-          <span className={`hidden md:flex items-center gap-1 text-xs ${saved ? (dark ? "text-zinc-600" : "text-zinc-400") : "text-amber-500"}`}>
+          <span className={`hidden md:flex items-center gap-1 text-xs ${saved ? (dark ? "text-stone-600" : "text-stone-400") : "text-amber-500"}`}>
             <Cloud size={12} /> {saved ? "Sincronizado" : "Guardando…"}
           </span>
-          <button onClick={toggleTheme} className={`p-2 rounded-xl transition-colors ${dark ? "text-zinc-300 hover:bg-zinc-800" : "text-zinc-500 hover:bg-zinc-100"}`}>
+          <button onClick={toggleTheme} className={`p-2 rounded-xl transition-colors ${dark ? "text-stone-300 hover:bg-stone-800" : "text-stone-500 hover:bg-stone-100"}`}>
             {dark ? <Sun size={17} /> : <Moon size={17} />}
           </button>
           <button onClick={onSignOut} title={`Cerrar sesión (${userEmail || ""})`}
-            className={`p-2 rounded-xl transition-colors ${dark ? "text-zinc-300 hover:bg-zinc-800" : "text-zinc-500 hover:bg-zinc-100"}`}>
+            className={`p-2 rounded-xl transition-colors ${dark ? "text-stone-300 hover:bg-stone-800" : "text-stone-500 hover:bg-stone-100"}`}>
             <LogOut size={17} />
           </button>
         </header>
@@ -1606,6 +1984,7 @@ export default function DashboardApp({ data, setData, saved, userEmail, onSignOu
         <div className="p-5 lg:p-7 max-w-6xl w-full mx-auto space-y-5">
           {tab === "dashboard" && (
             <>
+              <TodaySummary dark={dark} data={data} />
               <WeeklyObjective dark={dark} data={data} setData={setData} />
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
                 <div className="space-y-5">
@@ -1617,37 +1996,30 @@ export default function DashboardApp({ data, setData, saved, userEmail, onSignOu
                 <div className="space-y-5">
                   <DeepWork dark={dark} data={data} setData={setData} />
                   <Rules dark={dark} data={data} setData={setData} search={search} />
+                  <DailyJournal dark={dark} data={data} setData={setData} />
                   <Projects dark={dark} data={data} setData={setData} search={search} />
                 </div>
               </div>
 
               {/* El cierre del día vive al final: es lo último que haces. */}
               <RegisterDay dark={dark} data={data} setData={setData} />
-
-              <WeeklyDashboard dark={dark} data={data} setData={setData} />
             </>
           )}
-          {tab === "general" && <GeneralPanel dark={dark} data={data} setData={setData} saved={saved} />}
-          {tab === "semanal" && <WeeklyObjective dark={dark} data={data} setData={setData} />}
-          {tab === "dia" && (
+          {tab === "metricas" && (
             <div className="space-y-5">
-              <DailyGoals dark={dark} data={data} setData={setData} search={search} />
-              <RegisterDay dark={dark} data={data} setData={setData} />
+              <ConstanciaMap dark={dark} data={data} />
+              <WeeklyDashboard dark={dark} data={data} setData={setData} />
             </div>
           )}
-          {tab === "aleman" && <German dark={dark} data={data} setData={setData} />}
-          {tab === "alarma" && <AlarmSettings dark={dark} data={data} setData={setData} />}
-          {tab === "deep" && (
-            <div className="space-y-5">
-              <DeepWork dark={dark} data={data} setData={setData} />
-              <DeepWorkConfig dark={dark} data={data} setData={setData} />
-            </div>
-          )}
-          {tab === "entreno" && <Workouts dark={dark} data={data} setData={setData} search={search} />}
-          {tab === "lectura" && <Reading dark={dark} data={data} setData={setData} />}
           {tab === "proyectos" && <Projects dark={dark} data={data} setData={setData} search={search} />}
-          {tab === "metricas" && <WeeklyDashboard dark={dark} data={data} setData={setData} />}
-          {tab === "reglas" && <Rules dark={dark} data={data} setData={setData} search={search} />}
+          {tab === "ajustes" && (
+            <div className="space-y-5">
+              <RecurringManager dark={dark} data={data} setData={setData} />
+              <DeepWorkConfig dark={dark} data={data} setData={setData} />
+              <AlarmSettings dark={dark} data={data} setData={setData} />
+              <GeneralPanel dark={dark} data={data} setData={setData} saved={saved} />
+            </div>
+          )}
         </div>
       </main>
     </div>
