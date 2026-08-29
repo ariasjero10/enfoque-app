@@ -31,30 +31,30 @@ export default function Login() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-zinc-50 p-4">
-      <div className="w-full max-w-sm rounded-2xl border border-zinc-200 bg-white p-8"
+    <div className="min-h-screen flex items-center justify-center bg-stone-50 p-4">
+      <div className="w-full max-w-sm rounded-2xl border border-stone-200 bg-white p-8"
         style={{ boxShadow: "0 4px 24px rgba(16,24,40,.06)" }}>
         <div className="flex flex-col items-center mb-6">
-          <div className="w-12 h-12 rounded-2xl bg-indigo-600 flex items-center justify-center mb-3">
+          <div className="w-12 h-12 rounded-2xl bg-orange-600 flex items-center justify-center mb-3">
             <Flame size={22} className="text-white" />
           </div>
-          <h1 className="text-lg font-bold text-zinc-900">Enfoque</h1>
-          <p className="text-sm text-zinc-400">Tu dashboard de productividad</p>
+          <h1 className="text-lg font-bold text-stone-900">Enfoque</h1>
+          <p className="text-sm text-stone-400">Tu dashboard de productividad</p>
         </div>
 
         <div className="space-y-3">
-          <div className="flex items-center gap-2 rounded-xl border border-zinc-200 px-3 py-2.5 focus-within:border-indigo-500 transition-colors">
-            <Mail size={15} className="text-zinc-400" />
+          <div className="flex items-center gap-2 rounded-xl border border-stone-200 px-3 py-2.5 focus-within:border-orange-500 transition-colors">
+            <Mail size={15} className="text-stone-400" />
             <input type="email" placeholder="Correo electrónico" value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="flex-1 outline-none text-sm text-zinc-800 placeholder-zinc-400 bg-transparent" />
+              className="flex-1 outline-none text-sm text-stone-800 placeholder-stone-400 bg-transparent" />
           </div>
-          <div className="flex items-center gap-2 rounded-xl border border-zinc-200 px-3 py-2.5 focus-within:border-indigo-500 transition-colors">
-            <Lock size={15} className="text-zinc-400" />
+          <div className="flex items-center gap-2 rounded-xl border border-stone-200 px-3 py-2.5 focus-within:border-orange-500 transition-colors">
+            <Lock size={15} className="text-stone-400" />
             <input type="password" placeholder="Contraseña (mínimo 6 caracteres)" value={password}
               onChange={(e) => setPassword(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit()}
-              className="flex-1 outline-none text-sm text-zinc-800 placeholder-zinc-400 bg-transparent" />
+              className="flex-1 outline-none text-sm text-stone-800 placeholder-stone-400 bg-transparent" />
           </div>
         </div>
 
@@ -63,13 +63,13 @@ export default function Login() {
         )}
 
         <button onClick={submit} disabled={loading}
-          className="w-full mt-5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold py-2.5 transition-all active:scale-95 disabled:opacity-60 flex items-center justify-center gap-2">
+          className="w-full mt-5 rounded-xl bg-orange-600 hover:bg-orange-500 text-white text-sm font-semibold py-2.5 transition-all active:scale-95 disabled:opacity-60 flex items-center justify-center gap-2">
           {loading && <Loader2 size={15} className="animate-spin" />}
           {mode === "login" ? "Iniciar sesión" : "Crear cuenta"}
         </button>
 
         <button onClick={() => { setMode(mode === "login" ? "signup" : "login"); setMsg(null); }}
-          className="w-full mt-3 text-xs text-zinc-400 hover:text-indigo-500 transition-colors">
+          className="w-full mt-3 text-xs text-stone-400 hover:text-orange-500 transition-colors">
           {mode === "login" ? "¿No tienes cuenta? Crear una" : "¿Ya tienes cuenta? Iniciar sesión"}
         </button>
       </div>
