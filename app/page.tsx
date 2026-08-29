@@ -30,12 +30,12 @@ export default function Home() {
 
   if (!supabaseConfigured) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-zinc-50 p-6">
+      <div className="min-h-screen flex items-center justify-center bg-stone-50 p-6">
         <div className="max-w-md text-center">
-          <h1 className="font-bold text-zinc-900 mb-2">Falta configurar Supabase</h1>
-          <p className="text-sm text-zinc-500">
-            Crea el archivo <code className="text-indigo-600">.env.local</code> a partir de{" "}
-            <code className="text-indigo-600">.env.local.example</code> con la URL y la clave anon
+          <h1 className="font-bold text-stone-900 mb-2">Falta configurar Supabase</h1>
+          <p className="text-sm text-stone-500">
+            Crea el archivo <code className="text-orange-600">.env.local</code> a partir de{" "}
+            <code className="text-orange-600">.env.local.example</code> con la URL y la clave anon
             de tu proyecto (o configúralas como variables de entorno en Vercel) y vuelve a desplegar.
           </p>
         </div>
@@ -45,8 +45,8 @@ export default function Home() {
 
   if (checking || (session && data === null && !error)) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-zinc-50">
-        <div className="w-8 h-8 rounded-full border-2 border-indigo-500 border-t-transparent animate-spin" />
+      <div className="min-h-screen flex items-center justify-center bg-stone-50">
+        <div className="w-8 h-8 rounded-full border-2 border-orange-500 border-t-transparent animate-spin" />
       </div>
     );
   }
@@ -55,11 +55,11 @@ export default function Home() {
 
   if (error) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-zinc-50 p-6">
+      <div className="min-h-screen flex items-center justify-center bg-stone-50 p-6">
         <div className="max-w-md text-center">
-          <h1 className="font-bold text-zinc-900 mb-2">No pudimos conectar con la base de datos</h1>
-          <p className="text-sm text-zinc-500 mb-1">Verifica que ejecutaste el script <code>supabase/schema.sql</code> en tu proyecto de Supabase.</p>
-          <p className="text-xs text-zinc-400">Detalle: {error}</p>
+          <h1 className="font-bold text-stone-900 mb-2">No pudimos conectar con la base de datos</h1>
+          <p className="text-sm text-stone-500 mb-1">Verifica que ejecutaste el script <code>supabase/schema.sql</code> en tu proyecto de Supabase.</p>
+          <p className="text-xs text-stone-400">Detalle: {error}</p>
         </div>
       </div>
     );
