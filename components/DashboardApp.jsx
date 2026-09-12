@@ -113,6 +113,8 @@ export const defaultData = {
   pomodoro: { work: 25, brk: 5, cycles: 4 },
   alarm: { enabled: true, hour: 19, goals: true, reading: true, german: true, lastFired: null },
   settings: { theme: "light" },
+  // Ritual de entrada + checklist de entorno que se piden antes de arrancar Trabajo Profundo.
+  focus: { ritualEntrada: "", environmentChecklist: [] },
 };
 
 /* Siembra las rutinas recurrentes en un registro en curso.
@@ -121,7 +123,7 @@ export const defaultData = {
 function applyRecurring(current, recurring) {
   if (!recurring) return current;
   if (current.seededFor === current.forDate) return current;
-  const g = (recurring.goals || []).map((t) => ({ id: uid(), text: t.text, done: false, fromRecurring: t.id }));
+  const g = (recurring.goals || []).map((t) => ({ id: uid(), text: t.text, microInicio: t.microInicio || "", done: false, started: false, fromRecurring: t.id }));
   const w = (recurring.workouts || []).map((t) => ({ id: uid(), name: t.name, duration: t.duration || 45, desc: t.desc || "", done: false, fromRecurring: t.id }));
   return {
     ...current,
@@ -158,6 +160,9 @@ export function migrateData(d) {
   if (!out.recurring) out.recurring = { goals: [], workouts: [] };
   if (!out.reading) out.reading = { ...defaultData.reading };
   if (!out.reading.finished) out.reading.finished = [];
+  if (!out.focus) out.focus = { ...defaultData.focus };
+  if (typeof out.focus.ritualEntrada !== "string") out.focus.ritualEntrada = "";
+  if (!Array.isArray(out.focus.environmentChecklist)) out.focus.environmentChecklist = [];
 
   // Carga las rutinas recurrentes del día en curso (idempotente).
   out.current = applyRecurring(out.current, out.recurring);
@@ -187,6 +192,9 @@ const metGoals   = (r)       => (r.goals || []).length > 0 && (r.goals || []).ev
 const metReading = (r, data) => (r.readingMinutes || 0) >= (data?.reading?.plannedMinutes || 1);
 const metWorkout = (r)       => (r.workouts || []).some((w) => w.done);
 const metGerman  = (r)       => !!r.german?.done;
+// Esfuerzo: recompensa el intento, no solo el resultado. Cuenta el día si hiciste
+// al menos un ciclo de trabajo profundo O empezaste (o cumpliste) al menos un objetivo.
+const metEffort  = (r)       => (r.cycles || 0) >= 1 || (r.goals || []).some((g) => g.done || g.started);
 
 // Cuenta días consecutivos (hacia atrás desde hoy) en que se cumplió `metFn`.
 // Si hoy aún no tiene registro, no rompe la racha: empieza desde ayer.
@@ -207,6 +215,7 @@ function trailingStreak(data, metFn) {
 function constancyRows(data, days = 35) {
   const habits = [
     { key: "goals",   label: "Objetivos", met: metGoals },
+    { key: "effort",  label: "Esfuerzo",  met: metEffort },
     { key: "reading", label: "Lectura",   met: metReading },
     { key: "workout", label: "Entreno",   met: metWorkout },
     { key: "german",  label: "Alemán",    met: metGerman },
@@ -256,6 +265,14 @@ const playChime = () => {
       g.gain.exponentialRampToValueAtTime(0.001, t0 + 0.55);
       o.start(t0); o.stop(t0 + 0.6);
     });
+  } catch (e) {}
+};
+
+/* Micro-recompensa: dispara la celebración pequeña (o la grande) desde cualquier
+   parte de la app sin pasar props. El componente Celebration escucha este evento. */
+const cheer = (msg = "¡Bien!", level = "small") => {
+  try {
+    window.dispatchEvent(new CustomEvent("enfoque:cheer", { detail: { msg, level } }));
   } catch (e) {}
 };
 
@@ -398,9 +415,21 @@ function DailyGoals({ dark, data, setData, search }) {
     (g) => !search || g.text.toLowerCase().includes(search.toLowerCase())
   );
   const patch = (fn) => setData((d) => ({ ...d, current: fn(d.current) }));
-  const add = () => patch((c) => ({ ...c, goals: [...c.goals, { id: uid(), text: "Nuevo objetivo", done: false }] }));
-  const toggle = (id) => patch((c) => ({ ...c, goals: c.goals.map((g) => (g.id === id ? { ...g, done: !g.done } : g)) }));
+  const add = () => patch((c) => ({ ...c, goals: [...c.goals, { id: uid(), text: "Nuevo objetivo", done: false, started: false, microInicio: "" }] }));
+  const toggle = (id) => {
+    const g = (day.goals || []).find((x) => x.id === id);
+    const willBeDone = g ? !g.done : false;
+    patch((c) => ({ ...c, goals: c.goals.map((x) => (x.id === id ? { ...x, done: willBeDone, started: willBeDone ? true : x.started } : x)) }));
+    if (willBeDone) cheer("Objetivo cumplido");   // recompensa por resultado individual (pequeña)
+  };
+  // "Solo el mínimo": marca el objetivo como iniciado sin darlo por terminado.
+  // Cuenta para la racha de esfuerzo y dispara la micro-recompensa.
+  const startMin = (id) => {
+    patch((c) => ({ ...c, goals: c.goals.map((x) => (x.id === id ? { ...x, started: true } : x)) }));
+    cheer("Mínimo hecho · ya arrancaste");
+  };
   const edit = (id, text) => patch((c) => ({ ...c, goals: c.goals.map((g) => (g.id === id ? { ...g, text } : g)) }));
+  const editMicro = (id, microInicio) => patch((c) => ({ ...c, goals: c.goals.map((g) => (g.id === id ? { ...g, microInicio } : g)) }));
   const del = (id) => patch((c) => ({ ...c, goals: c.goals.filter((g) => g.id !== id) }));
   const doneCount = (day.goals || []).filter((g) => g.done).length;
 
@@ -413,14 +442,39 @@ function DailyGoals({ dark, data, setData, search }) {
       )}
       <div className="space-y-1">
         {goals.map((g) => (
-          <div key={g.id} className={`group flex items-center gap-3 rounded-xl px-2 py-2 transition-colors ${dark ? "hover:bg-stone-800" : "hover:bg-stone-50"}`}>
-            <button onClick={() => toggle(g.id)} className="shrink-0">
+          <div key={g.id} className={`group flex items-start gap-3 rounded-xl px-2 py-2 transition-colors ${dark ? "hover:bg-stone-800" : "hover:bg-stone-50"}`}>
+            <button onClick={() => toggle(g.id)} className="shrink-0 mt-0.5" title={g.done ? "Marcar como pendiente" : "Marcar como cumplido"}>
               {g.done
                 ? <CheckCircle2 size={19} className="text-orange-500" />
-                : <Circle size={19} className={dark ? "text-stone-600" : "text-stone-300"} />}
+                : g.started
+                  ? <Circle size={19} className="text-amber-500" />
+                  : <Circle size={19} className={dark ? "text-stone-600" : "text-stone-300"} />}
             </button>
-            <div className={`flex-1 text-sm ${g.done ? "line-through " + (dark ? "text-stone-600" : "text-stone-400") : dark ? "text-stone-200" : "text-stone-700"}`}>
-              <InlineEdit dark={dark} value={g.text} onSave={(t) => t && edit(g.id, t)} placeholder="Objetivo…" />
+            <div className="flex-1 min-w-0">
+              <div className={`text-sm ${g.done ? "line-through " + (dark ? "text-stone-600" : "text-stone-400") : dark ? "text-stone-200" : "text-stone-700"}`}>
+                <InlineEdit dark={dark} value={g.text} onSave={(t) => t && edit(g.id, t)} placeholder="Objetivo…" />
+              </div>
+              {/* Micro-inicio: la acción más pequeña que reduce la barrera de entrada */}
+              <div className={`text-xs mt-0.5 ${dark ? "text-stone-500" : "text-stone-400"}`}>
+                <InlineEdit dark={dark} value={g.microInicio || ""} onSave={(t) => editMicro(g.id, t)}
+                  placeholder="Micro-inicio (opcional): la acción mínima para arrancar…" />
+              </div>
+              {!g.done && (
+                <div className="mt-1.5">
+                  {g.started ? (
+                    <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-500">
+                      <Check size={12} /> Mínimo hecho
+                    </span>
+                  ) : (
+                    <button onClick={() => startMin(g.id)} title="Cuenta como esfuerzo, aunque no lo termines"
+                      className={`inline-flex items-center gap-1 text-xs font-medium rounded-full px-2 py-0.5 transition-colors active:scale-95 ${
+                        dark ? "bg-stone-800 text-stone-300 hover:bg-stone-700" : "bg-stone-100 text-stone-600 hover:bg-stone-200"
+                      }`}>
+                      <Play size={11} /> Solo el mínimo
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
             <IconBtn dark={dark} onClick={() => del(g.id)} title="Eliminar"><Trash2 size={14} /></IconBtn>
           </div>
@@ -444,9 +498,11 @@ function DailyGoals({ dark, data, setData, search }) {
 
 function DeepWork({ dark, data, setData }) {
   const cfg = data.pomodoro;
+  const focus = data.focus || {};
   const [phase, setPhase] = useState("idle"); // idle | work | break | done
   const [remaining, setRemaining] = useState(cfg.work * 60);
   const [cycle, setCycle] = useState(1);
+  const [gate, setGate] = useState(false);   // modal de ritual + entorno antes de arrancar
   const endRef = useRef(null);
   const phaseRef = useRef("idle");
   const cycleRef = useRef(1);
@@ -484,6 +540,7 @@ function DeepWork({ dark, data, setData }) {
         playChime();
         if (phaseRef.current === "work") {
           addMinutes(cfg.work, true);
+          cheer("Ciclo de enfoque completo · +1");   // recompensa el esfuerzo, no solo el final
           notify("Bloque de trabajo completado", "Comienza tu descanso. Respira.");
           setPhase("break");
           endRef.current = Date.now() + cfg.brk * 60 * 1000;
@@ -511,6 +568,9 @@ function DeepWork({ dark, data, setData }) {
     endRef.current = Date.now() + cfg.work * 60 * 1000;
     setRemaining(cfg.work * 60);
   };
+  // Si hay ritual de entrada o checklist de entorno configurados, primero se pasa por el modal.
+  const needsGate = !!(focus.ritualEntrada && focus.ritualEntrada.trim()) || (focus.environmentChecklist || []).length > 0;
+  const openStart = () => (needsGate ? setGate(true) : start());
   const stop = () => {
     if (phase === "work") {
       const elapsed = Math.floor((cfg.work * 60 - remaining) / 60);
@@ -570,11 +630,17 @@ function DeepWork({ dark, data, setData }) {
 
         <div className="flex gap-3 mt-5">
           {phase === "idle" || phase === "done" ? (
-            <PrimaryBtn onClick={start}><Play size={15} /> Iniciar</PrimaryBtn>
+            <PrimaryBtn onClick={openStart}><Play size={15} /> Iniciar</PrimaryBtn>
           ) : (
             <GhostBtn dark={dark} onClick={stop}><Square size={14} /> Detener</GhostBtn>
           )}
         </div>
+
+        <FocusGate
+          open={gate} dark={dark} focus={focus}
+          onCancel={() => setGate(false)}
+          onConfirm={() => { setGate(false); start(); }}
+        />
 
         {/* Configuración rápida, editable directamente en la tarjeta */}
         <div className="flex flex-wrap justify-center gap-4 mt-5">
@@ -1698,6 +1764,7 @@ function TodaySummary({ dark, data }) {
   const overall = Math.round((pillars.reduce((a, b) => a + b, 0) / pillars.length) * 100);
 
   const streaks = [
+    { label: "Esfuerzo",  n: trailingStreak(data, metEffort) },
     { label: "Objetivos", n: trailingStreak(data, metGoals) },
     { label: "Lectura",   n: trailingStreak(data, metReading) },
     { label: "Entreno",   n: trailingStreak(data, metWorkout) },
@@ -1813,44 +1880,78 @@ function ConstanciaMap({ dark, data }) {
    ============================================================ */
 
 function Celebration({ data }) {
-  const [show, setShow] = useState(false);
+  const [big, setBig] = useState(false);
+  const [mini, setMini] = useState(null);   // { id, msg } | null
   const doneFor = useRef(null);
+  const bigTimer = useRef(null);
   const c = data.current || {};
-  const goals = c.goals || [];
-  const allDone = goals.length > 0 && goals.every((g) => g.done);
 
+  // Día perfecto = todos los pilares del día cumplidos (no solo los objetivos).
+  // La celebración grande queda reservada para este momento.
+  const perfect = metGoals(c) && metReading(c, data) && metWorkout(c) && metGerman(c);
+
+  const fireBig = () => {
+    setBig(true);
+    playChime();
+    clearTimeout(bigTimer.current);
+    bigTimer.current = setTimeout(() => setBig(false), 2600);
+  };
+
+  // Celebración GRANDE: solo cuando el día se vuelve perfecto, una vez por día.
   useEffect(() => {
     const key = c.forDate || todayKey();
-    if (allDone && doneFor.current !== key) {
+    if (perfect && doneFor.current !== key) {
       doneFor.current = key;
-      setShow(true);
-      playChime();
-      const t = setTimeout(() => setShow(false), 2600);
-      return () => clearTimeout(t);
+      fireBig();
     }
-    if (!allDone && doneFor.current === key) doneFor.current = null;
-  }, [allDone, c.forDate]);
+    if (!perfect && doneFor.current === key) doneFor.current = null;
+    return () => clearTimeout(bigTimer.current);
+  }, [perfect, c.forDate]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (!show) return null;
+  // Celebración PEQUEÑA (o grande) disparada por eventos de esfuerzo/logro parcial.
+  useEffect(() => {
+    const onCheer = (e) => {
+      const level = e.detail?.level || "small";
+      const msg = e.detail?.msg || "¡Bien!";
+      if (level === "big") { fireBig(); return; }
+      const id = uid();
+      setMini({ id, msg });
+      setTimeout(() => setMini((m) => (m && m.id === id ? null : m)), 1200);
+    };
+    window.addEventListener("enfoque:cheer", onCheer);
+    return () => window.removeEventListener("enfoque:cheer", onCheer);
+  }, []);
+
   const colors = ["#f97316", "#f59e0b", "#10b981", "#8b5cf6", "#ea580c"];
   return (
-    <div className="fixed inset-0 z-50 pointer-events-none flex items-center justify-center">
-      <div className="relative">
-        {Array.from({ length: 16 }).map((_, i) => (
-          <span key={i} className="enfoque-confetti"
-            style={{
-              left: `${(Math.random() * 220 - 110)}px`, top: "-10px",
-              background: colors[i % colors.length],
-              animationDelay: `${Math.random() * 0.3}s`,
-            }} />
-        ))}
-        <div className="enfoque-pop flex flex-col items-center gap-2 rounded-2xl bg-orange-600 px-8 py-6 text-white shadow-2xl">
-          <Trophy size={34} />
-          <span className="text-lg font-bold">¡Día completo!</span>
-          <span className="text-sm text-orange-100">Cumpliste todos tus objetivos.</span>
+    <>
+      {big && (
+        <div className="fixed inset-0 z-50 pointer-events-none flex items-center justify-center">
+          <div className="relative">
+            {Array.from({ length: 16 }).map((_, i) => (
+              <span key={i} className="enfoque-confetti"
+                style={{
+                  left: `${(Math.random() * 220 - 110)}px`, top: "-10px",
+                  background: colors[i % colors.length],
+                  animationDelay: `${Math.random() * 0.3}s`,
+                }} />
+            ))}
+            <div className="enfoque-pop flex flex-col items-center gap-2 rounded-2xl bg-orange-600 px-8 py-6 text-white shadow-2xl">
+              <Trophy size={34} />
+              <span className="text-lg font-bold">¡Día perfecto!</span>
+              <span className="text-sm text-orange-100">Cumpliste todos los pilares de hoy.</span>
+            </div>
+          </div>
         </div>
-      </div>
-    </div>
+      )}
+      {mini && (
+        <div className="fixed inset-x-0 bottom-8 z-50 pointer-events-none flex justify-center px-4">
+          <div className="enfoque-mini flex items-center gap-2 rounded-full bg-emerald-600 px-4 py-2 text-white text-sm font-semibold shadow-xl">
+            <CheckCircle2 size={16} /> {mini.msg}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1862,8 +1963,9 @@ function RecurringManager({ dark, data, setData }) {
   const rec = data.recurring || { goals: [], workouts: [] };
   const setRec = (patch) => setData((d) => ({ ...d, recurring: { ...d.recurring, ...patch } }));
 
-  const addGoal = () => setRec({ goals: [...(rec.goals || []), { id: uid(), text: "Nuevo objetivo diario" }] });
+  const addGoal = () => setRec({ goals: [...(rec.goals || []), { id: uid(), text: "Nuevo objetivo diario", microInicio: "" }] });
   const editGoal = (id, text) => setRec({ goals: rec.goals.map((g) => (g.id === id ? { ...g, text } : g)) });
+  const editGoalMicro = (id, microInicio) => setRec({ goals: rec.goals.map((g) => (g.id === id ? { ...g, microInicio } : g)) });
   const delGoal = (id) => setRec({ goals: rec.goals.filter((g) => g.id !== id) });
 
   const addW = () => setRec({ workouts: [...(rec.workouts || []), { id: uid(), name: "Entrenamiento", duration: 45 }] });
@@ -1880,10 +1982,16 @@ function RecurringManager({ dark, data, setData }) {
       <p className={`text-xs font-semibold uppercase tracking-widest mb-2 ${dark ? "text-stone-500" : "text-stone-400"}`}>Objetivos diarios</p>
       <div className="space-y-1">
         {(rec.goals || []).map((g) => (
-          <div key={g.id} className={`group flex items-center gap-3 rounded-xl px-2 py-2 ${dark ? "hover:bg-stone-800" : "hover:bg-stone-50"}`}>
-            <Flame size={14} className="text-orange-500 shrink-0" />
-            <div className={`flex-1 text-sm ${dark ? "text-stone-200" : "text-stone-700"}`}>
-              <InlineEdit dark={dark} value={g.text} onSave={(t) => t && editGoal(g.id, t)} placeholder="Objetivo…" />
+          <div key={g.id} className={`group flex items-start gap-3 rounded-xl px-2 py-2 ${dark ? "hover:bg-stone-800" : "hover:bg-stone-50"}`}>
+            <Flame size={14} className="text-orange-500 shrink-0 mt-1" />
+            <div className="flex-1 min-w-0">
+              <div className={`text-sm ${dark ? "text-stone-200" : "text-stone-700"}`}>
+                <InlineEdit dark={dark} value={g.text} onSave={(t) => t && editGoal(g.id, t)} placeholder="Objetivo…" />
+              </div>
+              <div className={`text-xs mt-0.5 ${dark ? "text-stone-500" : "text-stone-400"}`}>
+                <InlineEdit dark={dark} value={g.microInicio || ""} onSave={(t) => editGoalMicro(g.id, t)}
+                  placeholder="Micro-inicio (opcional): la acción mínima para arrancar…" />
+              </div>
             </div>
             <IconBtn dark={dark} onClick={() => delGoal(g.id)} title="Quitar de la plantilla"><Trash2 size={14} /></IconBtn>
           </div>
@@ -1917,6 +2025,196 @@ function RecurringManager({ dark, data, setData }) {
 }
 
 /* ============================================================
+   PUERTA DE ENFOQUE — ritual de entrada + checklist de entorno
+   Se muestra antes de arrancar Trabajo Profundo (puntos 2 y 4).
+   ============================================================ */
+function FocusGate({ open, dark, focus, onConfirm, onCancel }) {
+  const items = focus?.environmentChecklist || [];
+  const [checked, setChecked] = useState([]);
+  // Al abrir, arranca con todos los ítems sin marcar.
+  useEffect(() => { if (open) setChecked(items.map(() => false)); }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!open) return null;
+  const ritual = (focus?.ritualEntrada || "").trim();
+  const allChecked = items.every((_, i) => checked[i]);
+  const toggle = (i) => setChecked((c) => c.map((v, j) => (j === i ? !v : v)));
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black bg-opacity-50" onClick={onCancel}>
+      <div onClick={(e) => e.stopPropagation()}
+        className={`w-full max-w-sm rounded-2xl border p-5 shadow-2xl ${dark ? "bg-stone-900 border-stone-800" : "bg-white border-stone-200"}`}>
+        <div className="flex items-center gap-2 mb-3">
+          <ShieldCheck size={18} className="text-orange-500" />
+          <h3 className={`text-sm font-bold ${dark ? "text-stone-100" : "text-stone-900"}`}>Antes de empezar</h3>
+        </div>
+
+        {ritual && (
+          <div className={`rounded-xl border p-3 mb-3 ${dark ? "border-stone-800 bg-stone-950" : "border-stone-100 bg-stone-50"}`}>
+            <p className={`text-sm ${dark ? "text-stone-200" : "text-stone-700"}`}>
+              ¿Ya tienes tu <b>{ritual}</b> contigo?
+            </p>
+            <p className={`text-xs mt-1 ${dark ? "text-stone-500" : "text-stone-400"}`}>Recuerda: solo es para esto.</p>
+          </div>
+        )}
+
+        {items.length > 0 && (
+          <div className="space-y-1 mb-4">
+            <p className={`text-xs font-semibold uppercase tracking-widest mb-1 ${dark ? "text-stone-500" : "text-stone-400"}`}>Prepara tu entorno</p>
+            {items.map((it, i) => (
+              <button key={i} onClick={() => toggle(i)}
+                className={`w-full flex items-center gap-2.5 rounded-xl px-2 py-2 text-left text-sm transition-colors ${dark ? "hover:bg-stone-800 text-stone-200" : "hover:bg-stone-50 text-stone-700"}`}>
+                {checked[i]
+                  ? <CheckCircle2 size={18} className="text-emerald-500 shrink-0" />
+                  : <Circle size={18} className={`shrink-0 ${dark ? "text-stone-600" : "text-stone-300"}`} />}
+                <span className={checked[i] ? (dark ? "text-stone-500" : "text-stone-400") : ""}>{it}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="flex gap-2 mt-2">
+          <PrimaryBtn onClick={onConfirm} className={!allChecked ? "opacity-50 pointer-events-none" : ""}>
+            <Play size={15} /> Listo, empezar
+          </PrimaryBtn>
+          <GhostBtn dark={dark} onClick={onCancel}>Cancelar</GhostBtn>
+        </div>
+        {items.length > 0 && !allChecked && (
+          <p className={`text-xs mt-2 ${dark ? "text-stone-500" : "text-stone-400"}`}>Marca todo tu entorno para poder empezar.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   RITUAL Y ENTORNO — configuración de la puerta de enfoque
+   ============================================================ */
+function EntryRitual({ dark, data, setData }) {
+  const focus = data.focus || { ritualEntrada: "", environmentChecklist: [] };
+  const setFocus = (patch) => setData((d) => ({ ...d, focus: { ...(d.focus || {}), ...patch } }));
+  const list = focus.environmentChecklist || [];
+
+  const setRitual = (v) => setFocus({ ritualEntrada: v });
+  const addItem = () => setFocus({ environmentChecklist: [...list, "Nuevo ítem"] });
+  const editItem = (i, v) => setFocus({ environmentChecklist: list.map((x, j) => (j === i ? v : x)) });
+  const delItem = (i) => setFocus({ environmentChecklist: list.filter((_, j) => j !== i) });
+
+  return (
+    <Card dark={dark}>
+      <SectionTitle dark={dark} icon={ShieldCheck} title="Ritual y entorno de enfoque" />
+      <p className={`text-sm mb-4 ${dark ? "text-stone-400" : "text-stone-500"}`}>
+        Se te piden justo antes de iniciar Trabajo Profundo. El ritual crea exclusividad; el checklist baja las distracciones antes de arrancar.
+      </p>
+
+      <label className={`text-xs font-medium ${dark ? "text-stone-400" : "text-stone-500"}`}>Ritual de entrada (opcional)</label>
+      <TextInput dark={dark} className="mt-1" value={focus.ritualEntrada || ""} onChange={(e) => setRitual(e.target.value)}
+        placeholder="Ej: Café de canela" />
+
+      <p className={`text-xs font-semibold uppercase tracking-widest mt-5 mb-2 ${dark ? "text-stone-500" : "text-stone-400"}`}>Checklist de entorno</p>
+      <div className="space-y-1">
+        {list.map((it, i) => (
+          <div key={i} className={`group flex items-center gap-3 rounded-xl px-2 py-2 ${dark ? "hover:bg-stone-800" : "hover:bg-stone-50"}`}>
+            <Circle size={13} className={`shrink-0 ${dark ? "text-stone-600" : "text-stone-300"}`} />
+            <div className={`flex-1 text-sm ${dark ? "text-stone-200" : "text-stone-700"}`}>
+              <InlineEdit dark={dark} value={it} onSave={(t) => (t ? editItem(i, t) : delItem(i))} placeholder="Ítem…" />
+            </div>
+            <IconBtn dark={dark} onClick={() => delItem(i)} title="Quitar"><Trash2 size={14} /></IconBtn>
+          </div>
+        ))}
+        {list.length === 0 && (
+          <p className={`text-sm py-2 ${dark ? "text-stone-600" : "text-stone-400"}`}>
+            Sin ítems. Agrega los que te ayuden a entrar en foco (ej: “Celular en otro cuarto”).
+          </p>
+        )}
+      </div>
+      <button onClick={addItem} className="mt-2 flex items-center gap-1.5 text-sm font-medium text-orange-500 hover:text-orange-400 transition-colors">
+        <Plus size={15} /> Agregar ítem
+      </button>
+    </Card>
+  );
+}
+
+/* ============================================================
+   CIERRE DEL DÍA — nunca terminar en cero (punto 5)
+   Aparece a la hora de la alarma si quedan objetivos sin cumplir y
+   pide UNA acción mínima garantizable para cerrar en positivo.
+   ============================================================ */
+function DayClose({ dark, data, setData }) {
+  const [show, setShow] = useState(false);
+  const [text, setText] = useState("");
+  const firedFor = useRef(null);
+  const ref = useRef(data);
+  ref.current = data;
+
+  useEffect(() => {
+    const check = () => {
+      const d = ref.current;
+      const a = d?.alarm;
+      if (!a?.enabled) return;
+      const c = d.current || {};
+      const key = c.forDate || todayKey();
+      if (c.dayClose?.done) return;          // ya cerraste en positivo hoy
+      if (firedFor.current === key) return;  // ya se ofreció hoy (no molestar cada minuto)
+      if (new Date().getHours() < Number(a.hour)) return;
+      const goals = c.goals || [];
+      const faltan = goals.length > 0 && !goals.every((g) => g.done);
+      if (!faltan) return;
+      firedFor.current = key;
+      setShow(true);
+    };
+    const iv = setInterval(check, 60000);
+    check();
+    return () => clearInterval(iv);
+  }, []);
+
+  if (!show) return null;
+
+  const cerrar = (nota) => {
+    setData((x) => ({
+      ...x,
+      current: { ...x.current, dayClose: { done: true, note: (nota || "").trim(), at: new Date().toISOString() } },
+    }));
+    setShow(false);
+    cheer("Día cerrado en positivo");   // micro-recompensa: el día nunca cierra en cero
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black bg-opacity-50">
+      <div className={`w-full max-w-sm rounded-2xl border p-5 shadow-2xl ${dark ? "bg-stone-900 border-stone-800" : "bg-white border-stone-200"}`}>
+        <div className="flex items-center gap-2 mb-2">
+          <Moon size={18} className="text-orange-500" />
+          <h3 className={`text-sm font-bold ${dark ? "text-stone-100" : "text-stone-900"}`}>Cierra el día en positivo</h3>
+        </div>
+        <p className={`text-sm ${dark ? "text-stone-300" : "text-stone-600"}`}>
+          Quedaron cosas sin marcar, y está bien. El día no se cierra en cero: haz una sola cosa mínima ahora.
+        </p>
+
+        <label className={`block text-xs font-medium mt-4 mb-1 ${dark ? "text-stone-400" : "text-stone-500"}`}>
+          Escribe una frase de lo que harás mañana
+        </label>
+        <textarea value={text} onChange={(e) => setText(e.target.value)} rows={2}
+          placeholder="Mañana, lo primero será…"
+          className={`w-full rounded-xl border px-3 py-2 text-sm outline-none focus:border-orange-500 resize-none ${
+            dark ? "bg-stone-950 border-stone-800 text-stone-100 placeholder-stone-600" : "bg-white border-stone-200 text-stone-800 placeholder-stone-400"
+          }`} />
+
+        <div className="flex flex-col gap-2 mt-4">
+          <PrimaryBtn onClick={() => cerrar(text)} className={!text.trim() ? "opacity-50 pointer-events-none" : ""}>
+            <Check size={15} /> Guardar y cerrar
+          </PrimaryBtn>
+          <GhostBtn dark={dark} onClick={() => cerrar("Hice algo hoy, aunque fuera pequeño.")}>
+            Hice algo hoy, aunque fuera pequeño
+          </GhostBtn>
+          <button onClick={() => setShow(false)} className={`text-xs mt-1 ${dark ? "text-stone-500 hover:text-stone-300" : "text-stone-400 hover:text-stone-600"}`}>
+            Ahora no
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
    APP PRINCIPAL
    ============================================================ */
 
@@ -1942,6 +2240,7 @@ export default function DashboardApp({ data, setData, saved, userEmail, onSignOu
   return (
     <div className={`min-h-screen flex transition-colors duration-300 ${dark ? "bg-stone-950 dark" : "bg-stone-50"}`}>
       <Celebration data={data} />
+      <DayClose dark={dark} data={data} setData={setData} />
       <Sidebar dark={dark} tab={tab} setTab={setTab} open={menuOpen} setOpen={setMenuOpen} />
 
       <main className="flex-1 min-w-0 flex flex-col h-screen overflow-y-auto">
@@ -2016,6 +2315,7 @@ export default function DashboardApp({ data, setData, saved, userEmail, onSignOu
             <div className="space-y-5">
               <RecurringManager dark={dark} data={data} setData={setData} />
               <DeepWorkConfig dark={dark} data={data} setData={setData} />
+              <EntryRitual dark={dark} data={data} setData={setData} />
               <AlarmSettings dark={dark} data={data} setData={setData} />
               <GeneralPanel dark={dark} data={data} setData={setData} saved={saved} />
             </div>
