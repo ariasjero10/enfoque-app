@@ -20,3 +20,12 @@ input[type="number"]::-webkit-inner-spin-button { opacity: 0.4; }
 }
 .enfoque-pop { animation: enfoque-pop .5s cubic-bezier(.2,.8,.3,1) both; }
 .enfoque-confetti { position: absolute; width: 8px; height: 8px; border-radius: 2px; animation: enfoque-fall 1.5s ease-in forwards; }
+
+/* Micro-recompensa: aparición breve al completar un ciclo, un objetivo o el cierre del día */
+@keyframes enfoque-mini {
+  0%   { transform: translateY(10px) scale(.9); opacity: 0; }
+  18%  { transform: translateY(0) scale(1.05); opacity: 1; }
+  82%  { transform: translateY(0) scale(1); opacity: 1; }
+  100% { transform: translateY(-8px) scale(1); opacity: 0; }
+}
+.enfoque-mini { animation: enfoque-mini 1.2s ease-out both; }
