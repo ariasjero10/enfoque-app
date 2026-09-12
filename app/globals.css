@@ -3,10 +3,31 @@
 @tailwind utilities;
 
 html, body { height: 100%; }
+body { background: #0A0A0B; }
 input[type="number"]::-webkit-inner-spin-button { opacity: 0.4; }
 *::-webkit-scrollbar { width: 8px; height: 8px; }
-*::-webkit-scrollbar-thumb { background: #d6d3d1; border-radius: 8px; }
-.dark *::-webkit-scrollbar-thumb { background: #44403c; }
+*::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 8px; }
+.dark *::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); }
+
+/* Botón primario con relieve "presionable" (gradiente + sombra de color) */
+.enfoque-primary {
+  background: linear-gradient(180deg, #34D399 0%, #10B981 100%);
+  box-shadow: 0 4px 14px rgba(52,211,153,.35), inset 0 1px 0 rgba(255,255,255,.25);
+}
+.enfoque-primary:hover { background: linear-gradient(180deg, #43E0A6 0%, #12C98C 100%); }
+.enfoque-primary:active {
+  box-shadow: 0 2px 8px rgba(52,211,153,.28), inset 0 1px 0 rgba(255,255,255,.2);
+  transform: translateY(1px) scale(.97);
+}
+.enfoque-primary.opacity-50 { box-shadow: none; }
+
+/* Micro-interacción del check al completarse: scale 0.8 -> 1.05 -> 1 */
+@keyframes enfoque-check {
+  0%   { transform: scale(.8); }
+  55%  { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+.enfoque-check { animation: enfoque-check .25s ease-out both; }
 
 /* Celebración al completar el día */
 @keyframes enfoque-pop {
