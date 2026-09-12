@@ -22,3 +22,19 @@ create policy "crear_propio" on public.dashboards
 
 create policy "actualizar_propio" on public.dashboards
   for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- ============================================================
+-- REFERENCIA · Claves JSON del sistema de hábitos (dopamina)
+-- La columna `data` es jsonb (sin esquema fijo): estas claves NO requieren
+-- ALTER TABLE. Se documentan aquí para saber qué guarda la app.
+--
+--   data.focus.ritualEntrada         text    ritual de entrada antes de enfocarse
+--   data.focus.environmentChecklist  text[]  ítems del checklist de entorno
+--   data.current.goals[].started     bool    "solo el mínimo" (esfuerzo, no resultado)
+--   data.current.goals[].microInicio text    micro-tarea de arranque del objetivo
+--   data.recurring.goals[].microInicio text  plantilla del micro-inicio
+--   data.current.dayClose            object  { done, note, at } cierre positivo del día
+--
+--   streak.effort  ->  NO se almacena; la app lo calcula (metEffort): días con
+--                      >=1 ciclo de trabajo profundo o >=1 objetivo iniciado/cumplido.
+-- ============================================================
